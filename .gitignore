@@ -1,0 +1,33 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller output
+build/
+dist/
+*.spec
+release/
+
+# Local PlexTraktSync state and secrets
+.env
+.pytrakt.json
+servers.yml
+config.yml
+Logs/
+Cache/
+*.log
+*.sqlite
+*.db
+
+# Local editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
