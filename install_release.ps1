@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $baseDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $taskName = "PlexTraktSync Tray"
-$user = "$env:COMPUTERNAME\$env:USERNAME"
+$user = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { "$env:COMPUTERNAME\$env:USERNAME" }
 
 $exeCandidates = @(
     (Join-Path $baseDir "PlexTraktSyncTray\PlexTraktSyncTray.exe"),

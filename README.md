@@ -13,6 +13,8 @@ This was vibe-coded with Codex during a real "please just make Plex and Trakt be
 - opens Plex Web and Trakt directly from the tray menu
 - opens the PlexTraktSync log and config folder
 - restarts the watcher if it exits
+- checks Trakt auth in the background and alerts if PlexTraktSync's saved token stops working
+- falls back to marking movies watched on Trakt when Plex reports a stopped movie at 90% or later
 
 ## Install
 
@@ -20,25 +22,21 @@ This was vibe-coded with Codex during a real "please just make Plex and Trakt be
 
 Use this if you just want the tray app installed.
 
-Before installing the tray app, you need:
+Requirements:
 
 - Windows 10 or 11
-- Python 3.10 or newer
-- a reachable Plex Media Server
-- a Trakt account
+- Python 3.10 or newer for `pipx` and PlexTraktSync
+- `pipx`
+- PlexTraktSync already installed and logged in with `pipx`
 
-The release zip bundles the tray app itself. Python is needed because PlexTraktSync runs through `pipx`, which is Python's recommended tool for installing command-line apps in their own isolated environments.
+The release zip bundles the tray app itself, so Python is mainly needed for the underlying `pipx` install of PlexTraktSync. Developer installs have been tested with Python 3.13 and 3.14.
 
-First install `pipx`, then install and log in to PlexTraktSync:
+PlexTraktSync's recommended install path is:
 
 ```powershell
-py -m pip install --user pipx
-py -m pipx ensurepath
 pipx install PlexTraktSync
 plextraktsync login
 ```
-
-If you just installed `pipx` for the first time, close and reopen PowerShell before running the `pipx install PlexTraktSync` command.
 
 Steps:
 
@@ -80,6 +78,24 @@ Use this if you want to edit or rebuild the app yourself.
 - `install_release.ps1` - registers a packaged release build as a Windows logon task
 - `build_release.ps1` - builds a zip suitable for GitHub Releases
 - `LICENSE` - MIT license
+
+## Trakt Watched Fallback
+
+PlexTraktSync normally handles Trakt scrobbling directly. The tray also watches for completed movie events and posts a watched-history fallback to Trakt if PlexTraktSync misses the final watched event. This uses PlexTraktSync's saved `.pytrakt.json` token and Plex movie IDs from `servers.yml`.
+
+A movie counts as completed when PlexTraktSync reports `Played: True` or when playback stops at 90% or later. That second rule matches Plex's default watched threshold and covers cases where Plex has marked the movie watched but PlexTraktSync's event still says `Played: False`.
+
+## Auth Health Checks
+
+The tray menu shows a Trakt auth status row.
+
+Trakt is checked by calling the Trakt API with PlexTraktSync's saved `.pytrakt.json` token. If it reports `Trakt auth failed`, run:
+
+```powershell
+plextraktsync trakt-login
+```
+
+Use `Check Auth Now` from the tray menu to force the check.
 
 ## Notes
 

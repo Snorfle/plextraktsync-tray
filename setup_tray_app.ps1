@@ -7,7 +7,7 @@ $requirements = Join-Path $baseDir "requirements.txt"
 $appScript = Join-Path $baseDir "plextraktsync_tray.py"
 $appExe = Join-Path $baseDir "dist\PlexTraktSyncTray\PlexTraktSyncTray.exe"
 $taskName = "PlexTraktSync Tray"
-$user = "$env:COMPUTERNAME\$env:USERNAME"
+$user = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { "$env:COMPUTERNAME\$env:USERNAME" }
 
 if (-not (Test-Path $venvDir)) {
     py -3 -m venv $venvDir
@@ -18,6 +18,7 @@ if (-not (Test-Path $venvDir)) {
 & $pythonExe -m pip install pyinstaller
 & $pythonExe -m PyInstaller --noconfirm --windowed --name PlexTraktSyncTray $appScript
 
+# Clean up the old pre-tray task name if it exists.
 try {
     Unregister-ScheduledTask -TaskName "PlexTraktSync Watch" -Confirm:$false -ErrorAction SilentlyContinue
 } catch {}

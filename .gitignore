@@ -19,6 +19,8 @@ release/
 .pytrakt.json
 servers.yml
 config.yml
+letterboxd_sync.json
+letterboxd_sync_state.json
 Logs/
 Cache/
 *.log

@@ -2,13 +2,18 @@ import ctypes
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
+import urllib.error
 import urllib.request
 import webbrowser
-from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pystray
@@ -22,19 +27,133 @@ BASE_DIR = Path(__file__).resolve().parent
 LOCAL_APPDATA = Path(os.environ["LOCALAPPDATA"]) / "PlexTraktSync" / "PlexTraktSync"
 PLEXTRAKTSYNC_PYTHON = Path.home() / "pipx" / "venvs" / "plextraktsync" / "Scripts" / "python.exe"
 LOG_FILE = LOCAL_APPDATA / "Logs" / "plextraktsync.log"
+PYTRAKT_CONFIG_FILE = LOCAL_APPDATA / ".pytrakt.json"
+SERVERS_CONFIG_FILE = LOCAL_APPDATA / "servers.yml"
+COMPLETED_MOVIE_STATE_FILE = LOCAL_APPDATA / "completed_movie_sync_state.json"
 CHECK_INTERVAL_SECONDS = 10
 RESTART_DELAY_SECONDS = 15
 LOG_TAIL_BYTES = 65536
 CREATE_NO_WINDOW = 0x08000000
 ERROR_ALREADY_EXISTS = 183
 MUTEX_NAME = "Local\\PlexTraktSyncTrayApp"
-PLEX_WEB_URL = "http://127.0.0.1:32400/web"
+PLEX_BASE_URL = "http://127.0.0.1:32400"
+PLEX_WEB_URL = f"{PLEX_BASE_URL}/web"
 TRAKT_WEB_URL = "https://trakt.tv/"
+TRAKT_API_SETTINGS_URL = "https://api.trakt.tv/users/settings"
 PYPI_JSON_URL = "https://pypi.org/pypi/plextraktsync/json"
 PLAYBACK_STALE_MINUTES = 30
+WATCHED_PROGRESS_THRESHOLD = 90.0
+TRAKT_AUTH_CHECK_SECONDS = 15 * 60
 ON_PLAY_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\[.*?\]:on_play: <[^>]+:(?P<title>.+)>: (?P<progress>[\d.]+)%, State: (?P<state>\w+)",
 )
+WATCHED_MOVIE_PATTERN = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\[.*?\]:on_play: "
+    r"<(?P<kind>[^:>]+):(?P<rating_key>\d+):(?P<title>.+)>: (?P<progress>[\d.]+)%, "
+    r"State: (?P<state>\w+), Played: (?P<played>True|False)",
+)
+
+@dataclass(frozen=True)
+class WatchedMovieEvent:
+    timestamp: datetime
+    rating_key: str
+    title: str
+    progress: float
+
+
+class CompletedMovieSync:
+    """Fallback watched-history sync for completed Plex movie watch events."""
+
+    def __init__(self, log_path: Path, state_path: Path) -> None:
+        self.log_path = log_path
+        self.state_path = state_path
+        self.lock = threading.Lock()
+        self.running = False
+        self.last_status = "Trakt fallback: waiting"
+        self.synced_keys = self._load_synced_keys()
+
+    def status_text(self) -> str:
+        if self.running:
+            return "Trakt fallback: syncing"
+        return self.last_status
+
+    def check_log(self) -> None:
+        if self.running:
+            return
+        event = self._latest_unsynced_event()
+        if event is None:
+            self.last_status = "Trakt fallback: waiting"
+            return
+
+        thread = threading.Thread(target=self._sync_event, args=(event,), daemon=True)
+        thread.start()
+
+    def _latest_unsynced_event(self) -> WatchedMovieEvent | None:
+        if not self.log_path.exists():
+            return None
+
+        try:
+            with self.log_path.open("rb") as log_file:
+                log_file.seek(0, os.SEEK_END)
+                size = log_file.tell()
+                log_file.seek(max(0, size - LOG_TAIL_BYTES))
+                lines = log_file.read().decode("utf-8", errors="replace").splitlines()
+        except OSError:
+            self.last_status = "Trakt fallback: log unavailable"
+            return None
+
+        for line in reversed(lines[-500:]):
+            event = completed_movie_event_from_log_line(line)
+            if event is None:
+                continue
+            sync_key = self._sync_key(event.rating_key, event.timestamp)
+            if sync_key not in self.synced_keys:
+                return event
+        return None
+
+    def _sync_event(self, event: WatchedMovieEvent) -> None:
+        with self.lock:
+            if self.running:
+                return
+            self.running = True
+
+        try:
+            self.last_status = f"Trakt fallback: logging {event.title}"
+            mark_trakt_movie_watched(event)
+            self.synced_keys.add(self._sync_key(event.rating_key, event.timestamp))
+            self._save_synced_keys()
+            self.last_status = f"Trakt fallback: logged {event.title}"
+            notify_message(f"Marked {event.title} watched on Trakt.")
+        except Exception as exc:
+            self.last_status = f"Trakt fallback failed: {friendly_error(exc)}"
+            notify_message(f"Trakt watched fallback failed: {friendly_error(exc)}.")
+        finally:
+            self.running = False
+            refresh_icon()
+
+    def _load_synced_keys(self) -> set[str]:
+        if not self.state_path.exists():
+            return set()
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return set()
+        return {str(item) for item in payload.get("synced", [])}
+
+    def _save_synced_keys(self) -> None:
+        cutoff = (datetime.now() - timedelta(days=180)).date().isoformat()
+        pruned = sorted(
+            key
+            for key in self.synced_keys
+            if ":" in key and key.split(":", 1)[1][:10] >= cutoff
+        )
+        self.synced_keys = set(pruned)
+        payload = {"synced": pruned}
+        self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _sync_key(rating_key: str, timestamp: datetime) -> str:
+        return f"{rating_key}:{timestamp.isoformat(timespec='minutes')}"
 
 
 class WatcherManager:
@@ -60,6 +179,7 @@ class WatcherManager:
             if self.is_running():
                 return
 
+            self.last_start_time = time.time()
             if not PLEXTRAKTSYNC_PYTHON.exists():
                 self.last_error = f"Missing watcher Python at {PLEXTRAKTSYNC_PYTHON}"
                 raise FileNotFoundError(self.last_error)
@@ -80,10 +200,9 @@ class WatcherManager:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env=watcher_env,
-                creationflags=CREATE_NO_WINDOW,
+                creationflags=CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
             )
             self.last_error = None
-            self.last_start_time = time.time()
             self.last_connected_at = self.last_start_time
             self.auto_restart = True
             self.paused = False
@@ -99,12 +218,16 @@ class WatcherManager:
             return
 
         if process.poll() is None:
-            process.terminate()
             try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
                 process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
 
         if notify:
             notify_message("Watcher stopped.")
@@ -184,30 +307,35 @@ class WatcherManager:
         return "Check for PlexTraktSync Update"
 
     def check_versions(self, notify: bool = False) -> None:
-        if self.version_checking:
-            return
-
-        self.version_checking = True
-        self.version_check_error = None
+        with self.lock:
+            if self.version_checking:
+                return
+            self.version_checking = True
+            self.version_check_error = None
 
         try:
-            self.current_version = get_installed_plextraktsync_version()
-            self.latest_version = get_latest_plextraktsync_version()
+            current_version = get_installed_plextraktsync_version()
+            latest_version = get_latest_plextraktsync_version()
+            with self.lock:
+                self.current_version = current_version
+                self.latest_version = latest_version
             if notify:
                 notify_message(self.update_text())
         except Exception as exc:
-            self.version_check_error = str(exc)
+            with self.lock:
+                self.version_check_error = str(exc)
             if notify:
                 notify_message(f"Version check failed: {exc}")
         finally:
-            self.version_checking = False
+            with self.lock:
+                self.version_checking = False
             refresh_icon()
 
     def upgrade_plextraktsync(self) -> None:
-        if self.updating:
-            return
-
-        self.updating = True
+        with self.lock:
+            if self.updating:
+                return
+            self.updating = True
         self.last_update_result = None
         was_paused = self.paused
         previous_auto_restart = self.auto_restart
@@ -249,9 +377,33 @@ class WatcherManager:
 
 
 manager = WatcherManager()
+completed_movie_sync = CompletedMovieSync(LOG_FILE, COMPLETED_MOVIE_STATE_FILE)
 tray_icon: pystray.Icon | None = None
 shutdown_event = threading.Event()
 instance_mutex = None
+_last_icon_state: tuple[bool, bool, str | None, bool | None] | None = None
+
+
+class StartupCache:
+    def __init__(self) -> None:
+        self.value: bool | None = None
+        self.checked_at = 0.0
+        self.lock = threading.Lock()
+
+    def get(self, ttl: float = 60.0) -> bool:
+        now = time.time()
+        with self.lock:
+            if self.value is None or now - self.checked_at > ttl:
+                self.value = startup_enabled()
+                self.checked_at = now
+            return self.value
+
+    def invalidate(self) -> None:
+        with self.lock:
+            self.value = None
+
+
+startup_cache = StartupCache()
 
 
 def create_image(color: str) -> Image.Image:
@@ -266,6 +418,8 @@ def create_image(color: str) -> Image.Image:
 
 
 def current_icon_image() -> Image.Image:
+    if auth_health.trakt_ok is False:
+        return create_image("#9a6700")
     if manager.is_running():
         return create_image("#18794e")
     if manager.paused:
@@ -326,6 +480,286 @@ def get_latest_plextraktsync_version() -> str:
     return str(version)
 
 
+def plextraktsync_server_name() -> str:
+    env_path = LOCAL_APPDATA / ".env"
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("PLEX_SERVER="):
+                return line.split("=", 1)[1].strip() or "default"
+    except OSError:
+        pass
+    return "default"
+
+
+def plextraktsync_server_connection() -> tuple[str, str]:
+    """Return the Plex base URL and token from PlexTraktSync's working server config."""
+
+    server_name = plextraktsync_server_name()
+    try:
+        text = SERVERS_CONFIG_FILE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError("PlexTraktSync servers.yml not found") from exc
+
+    pattern = re.compile(rf"^  {re.escape(server_name)}:\n(?P<body>(?:    .+\n|    - .+\n?)*)", re.MULTILINE)
+    match = pattern.search(text)
+    if match is None and server_name != "default":
+        match = re.search(r"^  default:\n(?P<body>(?:    .+\n|    - .+\n?)*)", text, re.MULTILINE)
+    if match is None:
+        raise RuntimeError(f"Plex server '{server_name}' not found in servers.yml")
+
+    body = match.group("body")
+    token_match = re.search(r"^\s+token:\s*(?P<token>\S+)", body, re.MULTILINE)
+    if token_match is None:
+        raise RuntimeError(f"Plex token missing for server '{server_name}'")
+    token = token_match.group("token").strip()
+
+    urls: list[str] = []
+    in_urls = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped == "urls:":
+            in_urls = True
+            continue
+        if in_urls and stripped.startswith("- "):
+            value = stripped[2:].strip()
+            if value and value != "null":
+                urls.append(value.rstrip("/"))
+            continue
+        if in_urls and stripped and not stripped.startswith("- "):
+            break
+
+    for url in urls:
+        try:
+            query = urllib.parse.urlencode({"X-Plex-Token": token})
+            with urllib.request.urlopen(f"{url}/?{query}", timeout=8):
+                return url, token
+        except Exception:
+            continue
+
+    if urls:
+        return urls[0], token
+    raise RuntimeError(f"Plex URL missing for server '{server_name}'")
+
+
+def plex_metadata_root(rating_key: str) -> ET.Element:
+    candidates = [plextraktsync_server_connection()]
+    last_error: Exception | None = None
+    for base_url, token in candidates:
+        try:
+            query = urllib.parse.urlencode({"X-Plex-Token": token})
+            url = f"{base_url}/library/metadata/{rating_key}?{query}"
+            with urllib.request.urlopen(url, timeout=20) as response:
+                return ET.fromstring(response.read())
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(f"Unable to read Plex item {rating_key}: {last_error}")
+
+
+def completed_movie_event_from_log_line(line: str) -> WatchedMovieEvent | None:
+    match = WATCHED_MOVIE_PATTERN.match(line)
+    if not match or match.group("kind") != "Movie":
+        return None
+
+    progress = float(match.group("progress"))
+    played = match.group("played") == "True"
+    stopped_at_threshold = match.group("state").lower() == "stopped" and progress >= WATCHED_PROGRESS_THRESHOLD
+    if not played and not stopped_at_threshold:
+        return None
+
+    try:
+        timestamp = datetime.strptime(match.group("timestamp"), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+    return WatchedMovieEvent(
+        timestamp=timestamp,
+        rating_key=match.group("rating_key"),
+        title=match.group("title").strip(),
+        progress=progress,
+    )
+
+
+def plex_movie_ids(rating_key: str) -> dict[str, object]:
+    root = plex_metadata_root(rating_key)
+    ids: dict[str, object] = {}
+    for guid in root.findall(".//Guid"):
+        value = guid.attrib.get("id", "")
+        if value.startswith("imdb://"):
+            ids["imdb"] = value.removeprefix("imdb://")
+        elif value.startswith("tmdb://"):
+            tmdb_id = value.removeprefix("tmdb://")
+            if tmdb_id.isdigit():
+                ids["tmdb"] = int(tmdb_id)
+        elif value.startswith("tvdb://"):
+            tvdb_id = value.removeprefix("tvdb://")
+            if tvdb_id.isdigit():
+                ids["tvdb"] = int(tvdb_id)
+    if not ids:
+        raise RuntimeError(f"No Trakt-compatible IDs found for Plex item {rating_key}")
+    return ids
+
+
+def trakt_headers() -> dict[str, str]:
+    payload = json.loads(PYTRAKT_CONFIG_FILE.read_text(encoding="utf-8"))
+    client_id = str(payload.get("CLIENT_ID", "")).strip()
+    token = str(payload.get("OAUTH_TOKEN", "")).strip()
+    if not client_id or not token:
+        raise RuntimeError("Trakt token missing")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "trakt-api-key": client_id,
+        "trakt-api-version": "2",
+        "User-Agent": APP_NAME,
+    }
+
+
+def mark_trakt_movie_watched(event: WatchedMovieEvent) -> None:
+    ids = plex_movie_ids(event.rating_key)
+    if trakt_movie_already_watched(ids, event.timestamp):
+        return
+
+    body = json.dumps(
+        {
+            "movies": [
+                {
+                    "watched_at": event.timestamp.astimezone().astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "ids": ids,
+                }
+            ]
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.trakt.tv/sync/history",
+        data=body,
+        headers=trakt_headers(),
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        if response.status not in {200, 201}:
+            raise RuntimeError(f"HTTP {response.status}")
+
+
+def trakt_movie_already_watched(ids: dict[str, object], watched_at: datetime) -> bool:
+    request = urllib.request.Request(
+        "https://api.trakt.tv/sync/history/movies?limit=50",
+        headers=trakt_headers(),
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        history = json.loads(response.read().decode("utf-8"))
+
+    for item in history:
+        movie_ids = item.get("movie", {}).get("ids", {})
+        if not movie_ids_match(ids, movie_ids):
+            continue
+        try:
+            existing = datetime.fromisoformat(str(item.get("watched_at", "")).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if abs((existing.replace(tzinfo=None) - watched_at).total_seconds()) <= 36 * 60 * 60:
+            return True
+    return False
+
+
+def movie_ids_match(left: dict[str, object], right: dict[str, object]) -> bool:
+    for key in ("imdb", "tmdb", "tvdb"):
+        if key in left and key in right and str(left[key]) == str(right[key]):
+            return True
+    return False
+
+
+class AuthHealth:
+    """Checks destination auth independently from the watcher process."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.running = False
+        self.last_trakt_check = 0.0
+        self.trakt_status = "Trakt: not checked"
+        self.trakt_ok: bool | None = None
+
+    def trakt_text(self) -> str:
+        with self.lock:
+            return self.trakt_status
+
+    def check_if_due(self, force: bool = False) -> None:
+        now = time.time()
+        trakt_due = force or now - self.last_trakt_check >= TRAKT_AUTH_CHECK_SECONDS
+        if not trakt_due:
+            return
+
+        with self.lock:
+            if self.running:
+                return
+            self.running = True
+
+        thread = threading.Thread(
+            target=self._run_checks,
+            args=(force,),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_checks(self, notify_success: bool) -> None:
+        try:
+            self._check_trakt(notify_success=notify_success)
+        finally:
+            with self.lock:
+                self.running = False
+            refresh_icon()
+
+    def _check_trakt(self, notify_success: bool = False) -> None:
+        self.last_trakt_check = time.time()
+        try:
+            payload = json.loads(PYTRAKT_CONFIG_FILE.read_text(encoding="utf-8"))
+            client_id = str(payload.get("CLIENT_ID", "")).strip()
+            token = str(payload.get("OAUTH_TOKEN", "")).strip()
+            if not client_id or not token:
+                raise RuntimeError("token missing")
+
+            request = urllib.request.Request(
+                TRAKT_API_SETTINGS_URL,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "trakt-api-key": client_id,
+                    "trakt-api-version": "2",
+                    "User-Agent": APP_NAME,
+                },
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"HTTP {response.status}")
+
+            self._set_trakt(True, "Trakt: auth ok", notify_success=notify_success)
+        except Exception as exc:
+            self._set_trakt(False, f"Trakt auth failed: {friendly_error(exc)}")
+
+    def _set_trakt(self, ok: bool, status: str, notify_success: bool = False) -> None:
+        previous = self.trakt_ok
+        with self.lock:
+            self.trakt_ok = ok
+            self.trakt_status = status
+        if not ok and previous is not False:
+            notify_message(f"{status}. Run PlexTraktSync trakt-login.")
+        elif ok and notify_success:
+            notify_message(status)
+
+
+def friendly_error(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code in {401, 403}:
+            return "unauthorized"
+        return f"HTTP {exc.code}"
+    if isinstance(exc, FileNotFoundError):
+        return "token file missing"
+    return type(exc).__name__
+
+
+auth_health = AuthHealth()
+
+
 def current_playback_text() -> str:
     """Return a short human status by reading recent PlexTraktSync watch logs."""
 
@@ -360,7 +794,7 @@ def current_playback_text() -> str:
         if state == "stopped":
             return "Running: idle"
 
-        title = match.group("title").replace("-", " ").strip()
+        title = match.group("title").strip()
         progress = float(match.group("progress"))
         return f"Running: {title} [{state} {progress:.1f}%]"
 
@@ -404,9 +838,19 @@ def set_startup_enabled(enabled: bool) -> None:
 
 
 def refresh_icon() -> None:
+    global _last_icon_state
+
     if tray_icon is None:
         return
-    tray_icon.icon = current_icon_image()
+    icon_state = (
+        manager.is_running(),
+        manager.paused,
+        manager.last_error,
+        auth_health.trakt_ok,
+    )
+    if icon_state != _last_icon_state:
+        tray_icon.icon = current_icon_image()
+        _last_icon_state = icon_state
     tray_icon.title = tooltip_text()
     tray_icon.update_menu()
 
@@ -421,6 +865,8 @@ def monitor_loop() -> None:
                     manager.start()
                 except Exception as exc:
                     manager.last_error = str(exc)
+        auth_health.check_if_due()
+        completed_movie_sync.check_log()
         refresh_icon()
         shutdown_event.wait(CHECK_INTERVAL_SECONDS)
 
@@ -501,8 +947,9 @@ def on_pause_resume(_: pystray.Icon, __: Item) -> None:
 
 def on_toggle_startup(_: pystray.Icon, __: Item) -> None:
     try:
-        enabled = startup_enabled()
+        enabled = startup_cache.get(ttl=0)
         set_startup_enabled(not enabled)
+        startup_cache.invalidate()
         notify_message("Start with Windows enabled." if not enabled else "Start with Windows disabled.")
     except Exception as exc:
         notify_message(f"Startup toggle failed: {exc}")
@@ -522,6 +969,12 @@ def on_update_plextraktsync(_: pystray.Icon, __: Item) -> None:
     refresh_icon()
 
 
+def on_check_auth(_: pystray.Icon, __: Item) -> None:
+    notify_message("Checking Trakt auth...")
+    auth_health.check_if_due(force=True)
+    refresh_icon()
+
+
 def on_exit(icon: pystray.Icon, _: Item) -> None:
     shutdown_event.set()
     manager.stop()
@@ -534,13 +987,16 @@ def build_menu() -> pystray.Menu:
         Item(lambda _: current_playback_text(), None, enabled=False),
         Item(lambda _: manager.connected_text(), None, enabled=False),
         Item(lambda _: manager.update_text(), None, enabled=False),
-        Item(lambda _: f"Start with Windows: {'enabled' if startup_enabled() else 'disabled'}", None, enabled=False),
+        Item(lambda _: auth_health.trakt_text(), None, enabled=False),
+        Item(lambda _: completed_movie_sync.status_text(), None, enabled=False),
+        Item(lambda _: f"Start with Windows: {'enabled' if startup_cache.get() else 'disabled'}", None, enabled=False),
         Item("Start Watcher", on_start, enabled=lambda _: not manager.is_running()),
         Item("Stop Watcher", on_stop, enabled=lambda _: manager.is_running()),
         Item(lambda _: "Resume Watcher" if manager.paused else "Pause Watcher", on_pause_resume),
         Item("Restart Watcher", on_restart),
         Item(lambda _: manager.update_action_text(), on_update_plextraktsync, enabled=lambda _: not manager.updating and not manager.version_checking),
-        Item(lambda _: "Disable Start With Windows" if startup_enabled() else "Enable Start With Windows", on_toggle_startup),
+        Item("Check Auth Now", on_check_auth, enabled=lambda _: not auth_health.running),
+        Item(lambda _: "Disable Start With Windows" if startup_cache.get() else "Enable Start With Windows", on_toggle_startup),
         Item("Open Plex Web", on_open_plex),
         Item("Open Trakt", on_open_trakt),
         Item("Open Log", on_open_log),
@@ -554,6 +1010,11 @@ def main() -> int:
     global instance_mutex
 
     kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.GetLastError.restype = ctypes.c_uint32
     # A named Windows mutex prevents duplicate tray apps when the scheduled task
     # is started manually while an instance is already running.
     instance_mutex = kernel32.CreateMutexW(None, False, MUTEX_NAME)
@@ -571,6 +1032,7 @@ def main() -> int:
         manager.last_error = str(exc)
 
     threading.Thread(target=manager.check_versions, daemon=True).start()
+    auth_health.check_if_due(force=True)
 
     tray_icon = pystray.Icon(APP_NAME, current_icon_image(), tooltip_text(), build_menu())
 
