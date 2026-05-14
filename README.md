@@ -97,6 +97,18 @@ plextraktsync trakt-login
 
 Use `Check Auth Now` from the tray menu to force the check.
 
+## Changelog
+
+### v0.2.0
+
+- added Trakt auth health checks in the tray menu
+- added a watched-history fallback for movies Plex marks watched at 90% or later
+- updated the packaged release zip
+
+### v0.1.0
+
+- initial Windows tray app release
+
 ## Notes
 
 - The tray app uses your existing `pipx` install of `PlexTraktSync`.
