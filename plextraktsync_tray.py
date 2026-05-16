@@ -44,12 +44,13 @@ PYPI_JSON_URL = "https://pypi.org/pypi/plextraktsync/json"
 PLAYBACK_STALE_MINUTES = 30
 WATCHED_PROGRESS_THRESHOLD = 90.0
 TRAKT_AUTH_CHECK_SECONDS = 15 * 60
+TRAKT_AUTH_RETRY_SECONDS = 60
 ON_PLAY_PATTERN = re.compile(
-    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\[.*?\]:on_play: <[^>]+:(?P<title>.+)>: (?P<progress>[\d.]+)%, State: (?P<state>\w+)",
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\[.*?\]:on_play: <[^>]+:(?P<title>.+)>: (?P<progress>\d+(?:\.\d+)?)%, State: (?P<state>\w+)",
 )
 WATCHED_MOVIE_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\[.*?\]:on_play: "
-    r"<(?P<kind>[^:>]+):(?P<rating_key>\d+):(?P<title>.+)>: (?P<progress>[\d.]+)%, "
+    r"<(?P<kind>[^:>]+):(?P<rating_key>\d+):(?P<title>.+)>: (?P<progress>\d+(?:\.\d+)?)%, "
     r"State: (?P<state>\w+), Played: (?P<played>True|False)",
 )
 
@@ -73,13 +74,17 @@ class CompletedMovieSync:
         self.synced_keys = self._load_synced_keys()
 
     def status_text(self) -> str:
-        if self.running:
+        with self.lock:
+            running = self.running
+            last_status = self.last_status
+        if running:
             return "Trakt fallback: syncing"
-        return self.last_status
+        return last_status
 
     def check_log(self) -> None:
-        if self.running:
-            return
+        with self.lock:
+            if self.running:
+                return
         event = self._latest_unsynced_event()
         if event is None:
             self.last_status = "Trakt fallback: waiting"
@@ -120,15 +125,22 @@ class CompletedMovieSync:
         try:
             self.last_status = f"Trakt fallback: logging {event.title}"
             mark_trakt_movie_watched(event)
-            self.synced_keys.add(self._sync_key(event.rating_key, event.timestamp))
-            self._save_synced_keys()
+            sync_key = self._sync_key(event.rating_key, event.timestamp)
+            self.synced_keys.add(sync_key)
+            try:
+                self._save_synced_keys()
+            except OSError as exc:
+                self.last_status = f"Trakt fallback: logged {event.title}; state save failed"
+                notify_message(f"Marked {event.title} watched on Trakt, but local dedupe state was not saved: {friendly_error(exc)}.")
+                return
             self.last_status = f"Trakt fallback: logged {event.title}"
             notify_message(f"Marked {event.title} watched on Trakt.")
         except Exception as exc:
             self.last_status = f"Trakt fallback failed: {friendly_error(exc)}"
             notify_message(f"Trakt watched fallback failed: {friendly_error(exc)}.")
         finally:
-            self.running = False
+            with self.lock:
+                self.running = False
             refresh_icon()
 
     def _load_synced_keys(self) -> set[str]:
@@ -149,7 +161,10 @@ class CompletedMovieSync:
         )
         self.synced_keys = set(pruned)
         payload = {"synced": pruned}
-        self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.state_path.with_name(f"{self.state_path.name}.tmp")
+        temp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        temp_path.replace(self.state_path)
 
     @staticmethod
     def _sync_key(rating_key: str, timestamp: datetime) -> str:
@@ -212,7 +227,6 @@ class WatcherManager:
     def stop(self, notify: bool = False) -> None:
         with self.lock:
             process = self.process
-            self.process = None
 
         if process is None:
             return
@@ -228,6 +242,10 @@ class WatcherManager:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
+
+        with self.lock:
+            if self.process is process:
+                self.process = None
 
         if notify:
             notify_message("Watcher stopped.")
@@ -306,11 +324,12 @@ class WatcherManager:
             return "Install PlexTraktSync Update"
         return "Check for PlexTraktSync Update"
 
-    def check_versions(self, notify: bool = False) -> None:
+    def check_versions(self, notify: bool = False, already_claimed: bool = False) -> None:
         with self.lock:
-            if self.version_checking:
+            if self.version_checking and not already_claimed:
                 return
-            self.version_checking = True
+            if not already_claimed:
+                self.version_checking = True
             self.version_check_error = None
 
         try:
@@ -331,11 +350,12 @@ class WatcherManager:
                 self.version_checking = False
             refresh_icon()
 
-    def upgrade_plextraktsync(self) -> None:
+    def upgrade_plextraktsync(self, already_claimed: bool = False) -> None:
         with self.lock:
-            if self.updating:
+            if self.updating and not already_claimed:
                 return
-            self.updating = True
+            if not already_claimed:
+                self.updating = True
         self.last_update_result = None
         was_paused = self.paused
         previous_auto_restart = self.auto_restart
@@ -365,15 +385,26 @@ class WatcherManager:
             self.last_error = str(exc)
             notify_message(f"PlexTraktSync update failed: {exc}")
         finally:
-            self.updating = False
-            self.paused = was_paused
-            self.auto_restart = previous_auto_restart
+            with self.lock:
+                self.updating = False
+                self.paused = was_paused
+                self.auto_restart = previous_auto_restart
             if not self.paused and self.auto_restart:
                 try:
                     self.start()
                 except Exception as exc:
                     self.last_error = str(exc)
             refresh_icon()
+
+    def claim_update_action(self):
+        with self.lock:
+            if self.updating or self.version_checking:
+                return None, None
+            if self.current_version and self.latest_version and self.current_version != self.latest_version:
+                self.updating = True
+                return "Updating PlexTraktSync...", lambda: self.upgrade_plextraktsync(already_claimed=True)
+            self.version_checking = True
+            return "Checking PlexTraktSync version...", lambda: self.check_versions(notify=True, already_claimed=True)
 
 
 manager = WatcherManager()
@@ -561,7 +592,10 @@ def completed_movie_event_from_log_line(line: str) -> WatchedMovieEvent | None:
     if not match or match.group("kind") != "Movie":
         return None
 
-    progress = float(match.group("progress"))
+    try:
+        progress = float(match.group("progress"))
+    except ValueError:
+        return None
     played = match.group("played") == "True"
     stopped_at_threshold = match.group("state").lower() == "stopped" and progress >= WATCHED_PROGRESS_THRESHOLD
     if not played and not stopped_at_threshold:
@@ -656,7 +690,7 @@ def trakt_movie_already_watched(ids: dict[str, object], watched_at: datetime) ->
         try:
             existing = datetime.fromisoformat(str(item.get("watched_at", "")).replace("Z", "+00:00"))
         except ValueError:
-            return True
+            continue
         if abs((existing.replace(tzinfo=None) - watched_at).total_seconds()) <= 36 * 60 * 60:
             return True
     return False
@@ -685,7 +719,8 @@ class AuthHealth:
 
     def check_if_due(self, force: bool = False) -> None:
         now = time.time()
-        trakt_due = force or now - self.last_trakt_check >= TRAKT_AUTH_CHECK_SECONDS
+        retry_after = TRAKT_AUTH_CHECK_SECONDS if self.trakt_ok is not False else TRAKT_AUTH_RETRY_SECONDS
+        trakt_due = force or now - self.last_trakt_check >= retry_after
         if not trakt_due:
             return
 
@@ -795,7 +830,10 @@ def current_playback_text() -> str:
             return "Running: idle"
 
         title = match.group("title").strip()
-        progress = float(match.group("progress"))
+        try:
+            progress = float(match.group("progress"))
+        except ValueError:
+            continue
         return f"Running: {title} [{state} {progress:.1f}%]"
 
     return "Running: idle"
@@ -859,15 +897,22 @@ def monitor_loop() -> None:
     """Refresh tray state and restart the watcher if it exits unexpectedly."""
 
     while not shutdown_event.is_set():
-        if not manager.is_running() and manager.auto_restart and not manager.paused:
-            if manager.last_start_time == 0 or (time.time() - manager.last_start_time) >= RESTART_DELAY_SECONDS:
-                try:
-                    manager.start()
-                except Exception as exc:
-                    manager.last_error = str(exc)
-        auth_health.check_if_due()
-        completed_movie_sync.check_log()
-        refresh_icon()
+        try:
+            if not manager.is_running() and manager.auto_restart and not manager.paused:
+                if manager.last_start_time == 0 or (time.time() - manager.last_start_time) >= RESTART_DELAY_SECONDS:
+                    try:
+                        manager.start()
+                    except Exception as exc:
+                        manager.last_error = str(exc)
+            auth_health.check_if_due()
+            completed_movie_sync.check_log()
+            refresh_icon()
+        except Exception as exc:
+            manager.last_error = str(exc)
+            try:
+                refresh_icon()
+            except Exception:
+                pass
         shutdown_event.wait(CHECK_INTERVAL_SECONDS)
 
 
@@ -957,12 +1002,10 @@ def on_toggle_startup(_: pystray.Icon, __: Item) -> None:
 
 
 def on_update_plextraktsync(_: pystray.Icon, __: Item) -> None:
-    if manager.current_version and manager.latest_version and manager.current_version != manager.latest_version:
-        notify_message("Updating PlexTraktSync...")
-        target = manager.upgrade_plextraktsync
-    else:
-        notify_message("Checking PlexTraktSync version...")
-        target = lambda: manager.check_versions(notify=True)
+    message, target = manager.claim_update_action()
+    if target is None:
+        return
+    notify_message(message)
 
     thread = threading.Thread(target=target, daemon=True)
     thread.start()
