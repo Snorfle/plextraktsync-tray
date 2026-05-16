@@ -99,17 +99,14 @@ Use `Check Auth Now` from the tray menu to force the check.
 
 ## Changelog
 
-### v0.2.1
-
-- hardened the tray supervisor so one failed status/auth/fallback check cannot kill the monitor loop
-- made watched-fallback dedupe state writes atomic
-- ignored malformed progress/history values instead of letting them break background sync
-- tightened watcher stop/update state handling to avoid duplicate background actions
-
 ### v0.2.0
 
 - added Trakt auth health checks in the tray menu
 - added a watched-history fallback for movies Plex marks watched at 90% or later
+- hardened the tray supervisor so one failed status/auth/fallback check cannot kill the monitor loop
+- made watched-fallback dedupe state writes atomic
+- ignored malformed progress/history values instead of letting them break background sync
+- tightened watcher stop/update state handling to avoid duplicate background actions
 - updated the packaged release zip
 
 ### v0.1.0
