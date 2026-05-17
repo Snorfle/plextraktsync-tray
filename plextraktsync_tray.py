@@ -4,6 +4,7 @@ import os
 import re
 import signal
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -12,6 +13,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,7 +31,8 @@ PLEXTRAKTSYNC_PYTHON = Path.home() / "pipx" / "venvs" / "plextraktsync" / "Scrip
 LOG_FILE = LOCAL_APPDATA / "Logs" / "plextraktsync.log"
 PYTRAKT_CONFIG_FILE = LOCAL_APPDATA / ".pytrakt.json"
 SERVERS_CONFIG_FILE = LOCAL_APPDATA / "servers.yml"
-COMPLETED_MOVIE_STATE_FILE = LOCAL_APPDATA / "completed_movie_sync_state.json"
+LEGACY_COMPLETED_MOVIE_STATE_FILE = LOCAL_APPDATA / "completed_movie_sync_state.json"
+TARGET_SYNC_LEDGER_FILE = LOCAL_APPDATA / "target_sync.sqlite"
 CHECK_INTERVAL_SECONDS = 10
 RESTART_DELAY_SECONDS = 15
 LOG_TAIL_BYTES = 65536
@@ -48,37 +51,221 @@ TRAKT_AUTH_RETRY_SECONDS = 60
 ON_PLAY_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\[.*?\]:on_play: <[^>]+:(?P<title>.+)>: (?P<progress>\d+(?:\.\d+)?)%, State: (?P<state>\w+)",
 )
-WATCHED_MOVIE_PATTERN = re.compile(
+WATCHED_MEDIA_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\[.*?\]:on_play: "
     r"<(?P<kind>[^:>]+):(?P<rating_key>\d+):(?P<title>.+)>: (?P<progress>\d+(?:\.\d+)?)%, "
     r"State: (?P<state>\w+), Played: (?P<played>True|False)",
 )
 
 @dataclass(frozen=True)
-class WatchedMovieEvent:
+class PlexPlaybackEvent:
     timestamp: datetime
+    kind: str
     rating_key: str
     title: str
     progress: float
 
 
-class CompletedMovieSync:
-    """Fallback watched-history sync for completed Plex movie watch events."""
+@dataclass(frozen=True)
+class MediaEvent:
+    source_event_key: str
+    content_type: str
+    title: str
+    watched_at: datetime
+    source_item_key: str
+    progress: float
+    tmdb_id: int | None = None
+    imdb_id: str | None = None
+    tvdb_id: int | None = None
+    season_number: int | None = None
+    episode_number: int | None = None
+    episode_title: str | None = None
 
-    def __init__(self, log_path: Path, state_path: Path) -> None:
+
+LEDGER_SCHEMA = """
+create table if not exists media_events(
+  id integer primary key,
+  source text not null,
+  source_event_key text not null unique,
+  content_type text not null,
+  title text not null,
+  season_number integer,
+  episode_number integer,
+  episode_title text,
+  watched_at text not null,
+  tmdb_id integer,
+  imdb_id text,
+  tvdb_id integer,
+  source_item_key text not null,
+  progress real not null,
+  created_at text not null
+);
+
+create table if not exists target_attempts(
+  id integer primary key,
+  media_event_id integer not null references media_events(id) on delete cascade,
+  target text not null,
+  status text not null,
+  request_summary text,
+  response_summary text,
+  attempted_at text not null
+);
+"""
+
+class TargetLedger:
+    """Durable per-target sync state for Plex playback events."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+        self.init()
+
+    def connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("pragma foreign_keys = on")
+        return conn
+
+    @contextmanager
+    def connection(self):
+        conn = self.connect()
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def init(self) -> None:
+        with self.lock:
+            with self.connection() as conn:
+                conn.executescript(LEDGER_SCHEMA)
+
+    def upsert_media_event(self, event: MediaEvent) -> int:
+        with self.lock:
+            with self.connection() as conn:
+                existing = conn.execute(
+                    "select id from media_events where source_event_key = ?",
+                    (event.source_event_key,),
+                ).fetchone()
+                if existing:
+                    return int(existing["id"])
+
+                cursor = conn.execute(
+                    """
+                    insert into media_events(
+                      source, source_event_key, content_type, title, season_number,
+                      episode_number, episode_title, watched_at, tmdb_id, imdb_id,
+                      tvdb_id, source_item_key, progress, created_at
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "plex",
+                        event.source_event_key,
+                        event.content_type,
+                        event.title,
+                        event.season_number,
+                        event.episode_number,
+                        event.episode_title,
+                        event.watched_at.isoformat(timespec="seconds"),
+                        event.tmdb_id,
+                        event.imdb_id,
+                        event.tvdb_id,
+                        event.source_item_key,
+                        event.progress,
+                        datetime.now().isoformat(timespec="seconds"),
+                    ),
+                )
+                return int(cursor.lastrowid)
+
+    def media_event_id(self, source_event_key: str) -> int | None:
+        with self.lock:
+            with self.connection() as conn:
+                row = conn.execute(
+                    "select id from media_events where source_event_key = ?",
+                    (source_event_key,),
+                ).fetchone()
+        return int(row["id"]) if row else None
+
+    def target_confirmed(self, media_event_id: int, target: str) -> bool:
+        with self.lock:
+            with self.connection() as conn:
+                row = conn.execute(
+                    """
+                    select 1
+                      from target_attempts
+                     where media_event_id = ?
+                       and target = ?
+                       and status in ('synced', 'already_present')
+                     limit 1
+                    """,
+                    (media_event_id, target),
+                ).fetchone()
+        return row is not None
+
+    def record_target_attempt(
+        self,
+        media_event_id: int,
+        target: str,
+        status: str,
+        request_summary: str | None = None,
+        response_summary: str | None = None,
+    ) -> None:
+        with self.lock:
+            with self.connection() as conn:
+                conn.execute(
+                    """
+                    insert into target_attempts(
+                      media_event_id, target, status, request_summary,
+                      response_summary, attempted_at
+                    ) values (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        media_event_id,
+                        target,
+                        status,
+                        request_summary,
+                        response_summary,
+                        datetime.now().isoformat(timespec="seconds"),
+                    ),
+                )
+
+    def target_status_text(self) -> str:
+        with self.lock:
+            with self.connection() as conn:
+                row = conn.execute(
+                    """
+                    select
+                      count(*) as total,
+                      sum(case when content_type = 'movie' then 1 else 0 end) as movies,
+                      sum(case when content_type = 'episode' then 1 else 0 end) as episodes
+                    from media_events
+                    """
+                ).fetchone()
+        total = int(row["total"] or 0)
+        movies = int(row["movies"] or 0)
+        episodes = int(row["episodes"] or 0)
+        return f"Ledger: {total} events ({movies} movies, {episodes} episodes)"
+
+
+class CompletedMediaSync:
+    """Records completed Plex playback events and runs the Trakt movie fallback."""
+
+    def __init__(self, log_path: Path, ledger: TargetLedger, legacy_state_path: Path) -> None:
         self.log_path = log_path
-        self.state_path = state_path
+        self.ledger = ledger
+        self.legacy_state_path = legacy_state_path
         self.lock = threading.Lock()
         self.running = False
-        self.last_status = "Trakt fallback: waiting"
-        self.synced_keys = self._load_synced_keys()
+        self.last_status = "Target sync: waiting"
+        self.legacy_synced_keys = self._load_legacy_synced_keys()
 
     def status_text(self) -> str:
         with self.lock:
             running = self.running
             last_status = self.last_status
         if running:
-            return "Trakt fallback: syncing"
+            return "Target sync: processing"
         return last_status
 
     def check_log(self) -> None:
@@ -87,13 +274,13 @@ class CompletedMovieSync:
                 return
         event = self._latest_unsynced_event()
         if event is None:
-            self.last_status = "Trakt fallback: waiting"
+            self.last_status = "Target sync: waiting"
             return
 
         thread = threading.Thread(target=self._sync_event, args=(event,), daemon=True)
         thread.start()
 
-    def _latest_unsynced_event(self) -> WatchedMovieEvent | None:
+    def _latest_unsynced_event(self) -> PlexPlaybackEvent | None:
         if not self.log_path.exists():
             return None
 
@@ -104,71 +291,83 @@ class CompletedMovieSync:
                 log_file.seek(max(0, size - LOG_TAIL_BYTES))
                 lines = log_file.read().decode("utf-8", errors="replace").splitlines()
         except OSError:
-            self.last_status = "Trakt fallback: log unavailable"
+            self.last_status = "Target sync: log unavailable"
             return None
 
         for line in reversed(lines[-500:]):
-            event = completed_movie_event_from_log_line(line)
+            event = completed_media_event_from_log_line(line)
             if event is None:
                 continue
-            sync_key = self._sync_key(event.rating_key, event.timestamp)
-            if sync_key not in self.synced_keys:
+            source_event_key = plex_source_event_key(event)
+            media_event_id = self.ledger.media_event_id(source_event_key)
+            if event.kind.lower() == "movie":
+                if self._legacy_sync_key(event) in self.legacy_synced_keys:
+                    continue
+                if media_event_id is None or not self.ledger.target_confirmed(media_event_id, "trakt"):
+                    return event
+            elif media_event_id is None:
                 return event
         return None
 
-    def _sync_event(self, event: WatchedMovieEvent) -> None:
+    def _sync_event(self, event: PlexPlaybackEvent) -> None:
         with self.lock:
             if self.running:
                 return
             self.running = True
 
+        media_event_id: int | None = None
         try:
-            self.last_status = f"Trakt fallback: logging {event.title}"
-            mark_trakt_movie_watched(event)
-            sync_key = self._sync_key(event.rating_key, event.timestamp)
-            self.synced_keys.add(sync_key)
-            try:
-                self._save_synced_keys()
-            except OSError as exc:
-                self.last_status = f"Trakt fallback: logged {event.title}; state save failed"
-                notify_message(f"Marked {event.title} watched on Trakt, but local dedupe state was not saved: {friendly_error(exc)}.")
+            self.last_status = f"Target sync: recording {event.title}"
+            media_event = media_event_from_plex_event(event)
+            media_event_id = self.ledger.upsert_media_event(media_event)
+            if media_event.content_type != "movie":
+                self.last_status = f"Target sync: recorded {media_event.title}"
                 return
-            self.last_status = f"Trakt fallback: logged {event.title}"
-            notify_message(f"Marked {event.title} watched on Trakt.")
+
+            if self.ledger.target_confirmed(media_event_id, "trakt"):
+                self.last_status = f"Trakt fallback: already handled {media_event.title}"
+                return
+
+            self.last_status = f"Trakt fallback: logging {media_event.title}"
+            status = mark_trakt_movie_watched(media_event)
+            self.ledger.record_target_attempt(
+                media_event_id,
+                "trakt",
+                status,
+                request_summary=f"movie {media_event.title}",
+                response_summary="Trakt history checked before write",
+            )
+            self.last_status = f"Trakt fallback: {status.replace('_', ' ')} {media_event.title}"
+            if status == "synced":
+                notify_message(f"Marked {media_event.title} watched on Trakt.")
         except Exception as exc:
-            self.last_status = f"Trakt fallback failed: {friendly_error(exc)}"
+            if media_event_id is not None:
+                self.ledger.record_target_attempt(
+                    media_event_id,
+                    "trakt",
+                    "failed_retryable",
+                    request_summary=event.title,
+                    response_summary=friendly_error(exc),
+                )
+            self.last_status = f"Target sync failed: {friendly_error(exc)}"
             notify_message(f"Trakt watched fallback failed: {friendly_error(exc)}.")
         finally:
             with self.lock:
                 self.running = False
             refresh_icon()
 
-    def _load_synced_keys(self) -> set[str]:
-        if not self.state_path.exists():
+    def _load_legacy_synced_keys(self) -> set[str]:
+        if not self.legacy_state_path.exists():
             return set()
         try:
-            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+            payload = json.loads(self.legacy_state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return set()
         return {str(item) for item in payload.get("synced", [])}
 
-    def _save_synced_keys(self) -> None:
-        cutoff = (datetime.now() - timedelta(days=180)).date().isoformat()
-        pruned = sorted(
-            key
-            for key in self.synced_keys
-            if ":" in key and key.split(":", 1)[1][:10] >= cutoff
-        )
-        self.synced_keys = set(pruned)
-        payload = {"synced": pruned}
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self.state_path.with_name(f"{self.state_path.name}.tmp")
-        temp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        temp_path.replace(self.state_path)
-
     @staticmethod
-    def _sync_key(rating_key: str, timestamp: datetime) -> str:
-        return f"{rating_key}:{timestamp.isoformat(timespec='minutes')}"
+    def _legacy_sync_key(event: PlexPlaybackEvent) -> str:
+        return f"{event.rating_key}:{event.timestamp.isoformat(timespec='minutes')}"
 
 
 class WatcherManager:
@@ -408,7 +607,8 @@ class WatcherManager:
 
 
 manager = WatcherManager()
-completed_movie_sync = CompletedMovieSync(LOG_FILE, COMPLETED_MOVIE_STATE_FILE)
+target_ledger = TargetLedger(TARGET_SYNC_LEDGER_FILE)
+completed_media_sync = CompletedMediaSync(LOG_FILE, target_ledger, LEGACY_COMPLETED_MOVIE_STATE_FILE)
 tray_icon: pystray.Icon | None = None
 shutdown_event = threading.Event()
 instance_mutex = None
@@ -587,9 +787,9 @@ def plex_metadata_root(rating_key: str) -> ET.Element:
     raise RuntimeError(f"Unable to read Plex item {rating_key}: {last_error}")
 
 
-def completed_movie_event_from_log_line(line: str) -> WatchedMovieEvent | None:
-    match = WATCHED_MOVIE_PATTERN.match(line)
-    if not match or match.group("kind") != "Movie":
+def completed_media_event_from_log_line(line: str) -> PlexPlaybackEvent | None:
+    match = WATCHED_MEDIA_PATTERN.match(line)
+    if not match or match.group("kind") not in {"Movie", "Episode"}:
         return None
 
     try:
@@ -606,16 +806,29 @@ def completed_movie_event_from_log_line(line: str) -> WatchedMovieEvent | None:
     except ValueError:
         return None
 
-    return WatchedMovieEvent(
+    return PlexPlaybackEvent(
         timestamp=timestamp,
+        kind=match.group("kind"),
         rating_key=match.group("rating_key"),
         title=match.group("title").strip(),
         progress=progress,
     )
 
 
-def plex_movie_ids(rating_key: str) -> dict[str, object]:
-    root = plex_metadata_root(rating_key)
+def plex_source_event_key(event: PlexPlaybackEvent) -> str:
+    return f"plex:{event.kind.lower()}:{event.rating_key}:{event.timestamp.isoformat(timespec='minutes')}"
+
+
+def plex_video_node(root: ET.Element) -> ET.Element:
+    if root.tag == "Video":
+        return root
+    video = root.find(".//Video")
+    if video is None:
+        raise RuntimeError("Plex metadata response did not include a Video item")
+    return video
+
+
+def plex_ids_from_root(root: ET.Element) -> dict[str, object]:
     ids: dict[str, object] = {}
     for guid in root.findall(".//Guid"):
         value = guid.attrib.get("id", "")
@@ -629,9 +842,60 @@ def plex_movie_ids(rating_key: str) -> dict[str, object]:
             tvdb_id = value.removeprefix("tvdb://")
             if tvdb_id.isdigit():
                 ids["tvdb"] = int(tvdb_id)
-    if not ids:
-        raise RuntimeError(f"No Trakt-compatible IDs found for Plex item {rating_key}")
     return ids
+
+
+def media_event_from_plex_event(event: PlexPlaybackEvent) -> MediaEvent:
+    root = plex_metadata_root(event.rating_key)
+    video = plex_video_node(root)
+    kind = event.kind.lower()
+    ids = plex_ids_from_root(root)
+
+    title = video.attrib.get("title") or event.title
+    season_number: int | None = None
+    episode_number: int | None = None
+    episode_title: str | None = None
+
+    if kind == "movie":
+        content_type = "movie"
+    elif kind == "episode":
+        content_type = "episode"
+        episode_title = title
+        title = video.attrib.get("grandparentTitle") or event.title
+        season_number = int_or_none(video.attrib.get("parentIndex"))
+        episode_number = int_or_none(video.attrib.get("index"))
+        show_rating_key = video.attrib.get("grandparentRatingKey")
+        if show_rating_key:
+            try:
+                ids = plex_ids_from_root(plex_metadata_root(show_rating_key)) or ids
+            except Exception:
+                pass
+    else:
+        raise RuntimeError(f"Unsupported Plex media kind {event.kind}")
+
+    return MediaEvent(
+        source_event_key=plex_source_event_key(event),
+        content_type=content_type,
+        title=title,
+        watched_at=event.timestamp,
+        source_item_key=f"plex:{event.rating_key}",
+        progress=event.progress,
+        tmdb_id=int_or_none(ids.get("tmdb")),
+        imdb_id=str(ids["imdb"]) if ids.get("imdb") else None,
+        tvdb_id=int_or_none(ids.get("tvdb")),
+        season_number=season_number,
+        episode_number=episode_number,
+        episode_title=episode_title,
+    )
+
+
+def int_or_none(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def trakt_headers() -> dict[str, str]:
@@ -649,16 +913,16 @@ def trakt_headers() -> dict[str, str]:
     }
 
 
-def mark_trakt_movie_watched(event: WatchedMovieEvent) -> None:
-    ids = plex_movie_ids(event.rating_key)
-    if trakt_movie_already_watched(ids, event.timestamp):
-        return
+def mark_trakt_movie_watched(event: MediaEvent) -> str:
+    ids = media_event_ids(event)
+    if trakt_movie_already_watched(ids, event.watched_at):
+        return "already_present"
 
     body = json.dumps(
         {
             "movies": [
                 {
-                    "watched_at": event.timestamp.astimezone().astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "watched_at": event.watched_at.astimezone().astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "ids": ids,
                 }
             ]
@@ -673,6 +937,20 @@ def mark_trakt_movie_watched(event: WatchedMovieEvent) -> None:
     with urllib.request.urlopen(request, timeout=20) as response:
         if response.status not in {200, 201}:
             raise RuntimeError(f"HTTP {response.status}")
+    return "synced"
+
+
+def media_event_ids(event: MediaEvent) -> dict[str, object]:
+    ids: dict[str, object] = {}
+    if event.imdb_id:
+        ids["imdb"] = event.imdb_id
+    if event.tmdb_id is not None:
+        ids["tmdb"] = event.tmdb_id
+    if event.tvdb_id is not None:
+        ids["tvdb"] = event.tvdb_id
+    if not ids:
+        raise RuntimeError(f"No Trakt-compatible IDs found for {event.title}")
+    return ids
 
 
 def trakt_movie_already_watched(ids: dict[str, object], watched_at: datetime) -> bool:
@@ -905,7 +1183,7 @@ def monitor_loop() -> None:
                     except Exception as exc:
                         manager.last_error = str(exc)
             auth_health.check_if_due()
-            completed_movie_sync.check_log()
+            completed_media_sync.check_log()
             refresh_icon()
         except Exception as exc:
             manager.last_error = str(exc)
@@ -1031,7 +1309,8 @@ def build_menu() -> pystray.Menu:
         Item(lambda _: manager.connected_text(), None, enabled=False),
         Item(lambda _: manager.update_text(), None, enabled=False),
         Item(lambda _: auth_health.trakt_text(), None, enabled=False),
-        Item(lambda _: completed_movie_sync.status_text(), None, enabled=False),
+        Item(lambda _: completed_media_sync.status_text(), None, enabled=False),
+        Item(lambda _: target_ledger.target_status_text(), None, enabled=False),
         Item(lambda _: f"Start with Windows: {'enabled' if startup_cache.get() else 'disabled'}", None, enabled=False),
         Item("Start Watcher", on_start, enabled=lambda _: not manager.is_running()),
         Item("Stop Watcher", on_stop, enabled=lambda _: manager.is_running()),

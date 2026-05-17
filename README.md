@@ -85,6 +85,12 @@ PlexTraktSync normally handles Trakt scrobbling directly. The tray also watches 
 
 A movie counts as completed when PlexTraktSync reports `Played: True` or when playback stops at 90% or later. That second rule matches Plex's default watched threshold and covers cases where Plex has marked the movie watched but PlexTraktSync's event still says `Played: False`.
 
+## Experimental Target Ledger
+
+The experimental multi-target branch stores completed Plex movie and episode events in a local SQLite ledger at `%LOCALAPPDATA%\PlexTraktSync\PlexTraktSync\target_sync.sqlite`.
+
+The ledger separates media events from target attempts so future targets can be handled independently. For example, a movie can be `synced` on Trakt while still pending on another target. This branch still only writes the existing Trakt movie fallback; completed episodes are recorded for future Simkl or Serializd work but are not written to Trakt by the tray.
+
 ## Auth Health Checks
 
 The tray menu shows a Trakt auth status row.
