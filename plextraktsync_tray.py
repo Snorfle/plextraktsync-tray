@@ -56,6 +56,13 @@ WATCHED_MEDIA_PATTERN = re.compile(
     r"<(?P<kind>[^:>]+):(?P<rating_key>\d+):(?P<title>.+)>: (?P<progress>\d+(?:\.\d+)?)%, "
     r"State: (?P<state>\w+), Played: (?P<played>True|False)",
 )
+TERMINAL_TARGET_STATUSES = {
+    "synced",
+    "already_present",
+    "planned_read_only",
+    "blocked",
+    "not_applicable",
+}
 
 @dataclass(frozen=True)
 class PlexPlaybackEvent:
@@ -188,18 +195,20 @@ class TargetLedger:
         return int(row["id"]) if row else None
 
     def target_confirmed(self, media_event_id: int, target: str) -> bool:
+        statuses = tuple(TERMINAL_TARGET_STATUSES)
+        placeholders = ", ".join("?" for _ in statuses)
         with self.lock:
             with self.connection() as conn:
                 row = conn.execute(
-                    """
+                    f"""
                     select 1
                       from target_attempts
                      where media_event_id = ?
                        and target = ?
-                       and status in ('synced', 'already_present')
+                       and status in ({placeholders})
                      limit 1
                     """,
-                    (media_event_id, target),
+                    (media_event_id, target, *statuses),
                 ).fetchone()
         return row is not None
 
@@ -247,13 +256,110 @@ class TargetLedger:
         episodes = int(row["episodes"] or 0)
         return f"Ledger: {total} events ({movies} movies, {episodes} episodes)"
 
+    def target_summary_text(self) -> str:
+        with self.lock:
+            with self.connection() as conn:
+                rows = list(
+                    conn.execute(
+                        """
+                        select target, status, count(*) as count
+                          from target_attempts
+                         group by target, status
+                         order by target, status
+                        """
+                    )
+                )
+        if not rows:
+            return "Targets: no attempts yet"
+        parts = [f"{row['target']} {row['status']}={row['count']}" for row in rows]
+        return "Targets: " + ", ".join(parts[:4])
+
+
+class SyncTarget:
+    name = "target"
+
+    def is_configured(self) -> bool:
+        return True
+
+    def applies_to(self, event: MediaEvent) -> bool:
+        return True
+
+    def status_text(self) -> str:
+        return f"{self.name}: ready"
+
+    def sync(self, event: MediaEvent) -> str:
+        raise NotImplementedError
+
+
+class TraktTarget(SyncTarget):
+    name = "trakt"
+
+    def applies_to(self, event: MediaEvent) -> bool:
+        # Keep current public behavior: the tray only fills missed movie history.
+        return event.content_type == "movie"
+
+    def sync(self, event: MediaEvent) -> str:
+        return mark_trakt_movie_watched(event)
+
+    def status_text(self) -> str:
+        return auth_health.trakt_text()
+
+
+class SerializdTarget(SyncTarget):
+    name = "serializd"
+
+    def is_configured(self) -> bool:
+        return True
+
+    def applies_to(self, event: MediaEvent) -> bool:
+        return event.content_type == "episode"
+
+    def status_text(self) -> str:
+        return "Serializd: read-only planning"
+
+    def sync(self, event: MediaEvent) -> str:
+        if event.tmdb_id is None:
+            return "blocked"
+        if event.season_number is None or event.episode_number is None:
+            return "blocked"
+        return "planned_read_only"
+
+
+class TargetDispatcher:
+    def __init__(self, targets: list[SyncTarget]) -> None:
+        self.targets = targets
+
+    def configured_targets_for(self, event: MediaEvent) -> list[SyncTarget]:
+        return [target for target in self.targets if target.applies_to(event) and target.is_configured()]
+
+    def may_have_pending_work(self, event: PlexPlaybackEvent, media_event_id: int | None, ledger: TargetLedger) -> bool:
+        if media_event_id is None:
+            return True
+        content_type = "movie" if event.kind.lower() == "movie" else "episode"
+        probe = MediaEvent(
+            source_event_key=plex_source_event_key(event),
+            content_type=content_type,
+            title=event.title,
+            watched_at=event.timestamp,
+            source_item_key=f"plex:{event.rating_key}",
+            progress=event.progress,
+        )
+        return any(
+            not ledger.target_confirmed(media_event_id, target.name)
+            for target in self.configured_targets_for(probe)
+        )
+
+    def status_lines(self) -> list[str]:
+        return [target.status_text() for target in self.targets if target.name != "trakt"]
+
 
 class CompletedMediaSync:
     """Records completed Plex playback events and runs the Trakt movie fallback."""
 
-    def __init__(self, log_path: Path, ledger: TargetLedger, legacy_state_path: Path) -> None:
+    def __init__(self, log_path: Path, ledger: TargetLedger, dispatcher: TargetDispatcher, legacy_state_path: Path) -> None:
         self.log_path = log_path
         self.ledger = ledger
+        self.dispatcher = dispatcher
         self.legacy_state_path = legacy_state_path
         self.lock = threading.Lock()
         self.running = False
@@ -303,9 +409,9 @@ class CompletedMediaSync:
             if event.kind.lower() == "movie":
                 if self._legacy_sync_key(event) in self.legacy_synced_keys:
                     continue
-                if media_event_id is None or not self.ledger.target_confirmed(media_event_id, "trakt"):
+                if self.dispatcher.may_have_pending_work(event, media_event_id, self.ledger):
                     return event
-            elif media_event_id is None:
+            elif self.dispatcher.may_have_pending_work(event, media_event_id, self.ledger):
                 return event
         return None
 
@@ -316,35 +422,38 @@ class CompletedMediaSync:
             self.running = True
 
         media_event_id: int | None = None
+        current_target = "target"
         try:
             self.last_status = f"Target sync: recording {event.title}"
             media_event = media_event_from_plex_event(event)
             media_event_id = self.ledger.upsert_media_event(media_event)
-            if media_event.content_type != "movie":
+
+            targets = self.dispatcher.configured_targets_for(media_event)
+            if not targets:
                 self.last_status = f"Target sync: recorded {media_event.title}"
                 return
 
-            if self.ledger.target_confirmed(media_event_id, "trakt"):
-                self.last_status = f"Trakt fallback: already handled {media_event.title}"
-                return
-
-            self.last_status = f"Trakt fallback: logging {media_event.title}"
-            status = mark_trakt_movie_watched(media_event)
-            self.ledger.record_target_attempt(
-                media_event_id,
-                "trakt",
-                status,
-                request_summary=f"movie {media_event.title}",
-                response_summary="Trakt history checked before write",
-            )
-            self.last_status = f"Trakt fallback: {status.replace('_', ' ')} {media_event.title}"
-            if status == "synced":
-                notify_message(f"Marked {media_event.title} watched on Trakt.")
+            for target in targets:
+                if self.ledger.target_confirmed(media_event_id, target.name):
+                    continue
+                current_target = target.name
+                self.last_status = f"{target.name.title()}: syncing {media_event.title}"
+                status = target.sync(media_event)
+                self.ledger.record_target_attempt(
+                    media_event_id,
+                    target.name,
+                    status,
+                    request_summary=f"{media_event.content_type} {media_event.title}",
+                    response_summary=f"{target.name} returned {status}",
+                )
+                self.last_status = f"{target.name.title()}: {status.replace('_', ' ')} {media_event.title}"
+                if target.name == "trakt" and status == "synced":
+                    notify_message(f"Marked {media_event.title} watched on Trakt.")
         except Exception as exc:
             if media_event_id is not None:
                 self.ledger.record_target_attempt(
                     media_event_id,
-                    "trakt",
+                    current_target,
                     "failed_retryable",
                     request_summary=event.title,
                     response_summary=friendly_error(exc),
@@ -608,7 +717,10 @@ class WatcherManager:
 
 manager = WatcherManager()
 target_ledger = TargetLedger(TARGET_SYNC_LEDGER_FILE)
-completed_media_sync = CompletedMediaSync(LOG_FILE, target_ledger, LEGACY_COMPLETED_MOVIE_STATE_FILE)
+trakt_target = TraktTarget()
+serializd_target = SerializdTarget()
+target_dispatcher = TargetDispatcher([trakt_target, serializd_target])
+completed_media_sync = CompletedMediaSync(LOG_FILE, target_ledger, target_dispatcher, LEGACY_COMPLETED_MOVIE_STATE_FILE)
 tray_icon: pystray.Icon | None = None
 shutdown_event = threading.Event()
 instance_mutex = None
@@ -1309,8 +1421,10 @@ def build_menu() -> pystray.Menu:
         Item(lambda _: manager.connected_text(), None, enabled=False),
         Item(lambda _: manager.update_text(), None, enabled=False),
         Item(lambda _: auth_health.trakt_text(), None, enabled=False),
+        Item(lambda _: serializd_target.status_text(), None, enabled=False),
         Item(lambda _: completed_media_sync.status_text(), None, enabled=False),
         Item(lambda _: target_ledger.target_status_text(), None, enabled=False),
+        Item(lambda _: target_ledger.target_summary_text(), None, enabled=False),
         Item(lambda _: f"Start with Windows: {'enabled' if startup_cache.get() else 'disabled'}", None, enabled=False),
         Item("Start Watcher", on_start, enabled=lambda _: not manager.is_running()),
         Item("Stop Watcher", on_stop, enabled=lambda _: manager.is_running()),
