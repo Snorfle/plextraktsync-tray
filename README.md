@@ -89,12 +89,12 @@ A movie counts as completed when PlexTraktSync reports `Played: True` or when pl
 
 The experimental multi-target branch stores completed Plex movie and episode events in a local SQLite ledger at `%LOCALAPPDATA%\PlexTraktSync\PlexTraktSync\target_sync.sqlite`.
 
-The ledger separates media events from target attempts so targets can be handled independently. For example, a movie can be `synced` on Trakt while an episode is planned for Serializd.
+The ledger separates media events from target attempts so targets can be handled independently. For example, a movie can be `synced` on Trakt while an episode is synced to Serializd.
 
 This branch includes experimental target dispatchers:
 
 - Trakt writes the existing missed-movie fallback only.
-- Serializd records completed episodes as read-only planned items in the ledger, but does not write to Serializd yet.
+- Serializd writes completed episodes when a bearer token is available from `SERIALIZD_TOKEN` or the existing Streaming History Sync Serializd token in Windows Credential Manager.
 
 ## Auth Health Checks
 

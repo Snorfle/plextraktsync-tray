@@ -43,6 +43,9 @@ PLEX_BASE_URL = "http://127.0.0.1:32400"
 PLEX_WEB_URL = f"{PLEX_BASE_URL}/web"
 TRAKT_WEB_URL = "https://trakt.tv/"
 TRAKT_API_SETTINGS_URL = "https://api.trakt.tv/users/settings"
+SERIALIZD_API_BASE_URL = "https://serializd.onrender.com"
+SERIALIZD_KEYRING_SERVICE = "StreamingHistorySync.Serializd"
+SERIALIZD_KEYRING_TOKEN_USERNAME = "oauth"
 PYPI_JSON_URL = "https://pypi.org/pypi/plextraktsync/json"
 PLAYBACK_STALE_MINUTES = 30
 WATCHED_PROGRESS_THRESHOLD = 90.0
@@ -59,7 +62,6 @@ WATCHED_MEDIA_PATTERN = re.compile(
 TERMINAL_TARGET_STATUSES = {
     "synced",
     "already_present",
-    "planned_read_only",
     "blocked",
     "not_applicable",
 }
@@ -308,21 +310,75 @@ class TraktTarget(SyncTarget):
 class SerializdTarget(SyncTarget):
     name = "serializd"
 
+    def __init__(self) -> None:
+        self.last_status = "Serializd: not checked"
+
     def is_configured(self) -> bool:
+        try:
+            self._token()
+        except Exception as exc:
+            self.last_status = f"Serializd: not configured ({friendly_error(exc)})"
+            return False
+        self.last_status = "Serializd: configured"
         return True
 
     def applies_to(self, event: MediaEvent) -> bool:
         return event.content_type == "episode"
 
     def status_text(self) -> str:
-        return "Serializd: read-only planning"
+        return self.last_status
 
     def sync(self, event: MediaEvent) -> str:
         if event.tmdb_id is None:
             return "blocked"
         if event.season_number is None or event.episode_number is None:
             return "blocked"
-        return "planned_read_only"
+        token = self._token()
+        show_payload = serializd_request("GET", f"/api/show/{event.tmdb_id}")
+        serializd_show_id = int_or_none(show_payload.get("id")) or event.tmdb_id
+        season_payload = serializd_request("GET", f"/api/show/{event.tmdb_id}/season/{event.season_number}")
+        serializd_season_id = int_or_none(season_payload.get("seasonId")) or int_or_none(season_payload.get("id"))
+        if serializd_season_id is None:
+            self.last_status = "Serializd: season lookup failed"
+            return "failed_retryable"
+
+        episode_lookup = {
+            int(item["episodeNumber"]): item
+            for item in season_payload.get("episodes", [])
+            if item.get("episodeNumber") is not None
+        }
+        if int(event.episode_number) not in episode_lookup:
+            self.last_status = "Serializd: episode lookup failed"
+            return "failed_retryable"
+
+        serializd_request(
+            "POST",
+            "/api/show/reviews/add",
+            token=token,
+            body=serializd_episode_log_payload(
+                show_id=int(serializd_show_id),
+                season_id=int(serializd_season_id),
+                episode_number=int(event.episode_number),
+                watched_at=event.watched_at,
+            ),
+        )
+        self.last_status = "Serializd: synced"
+        return "synced"
+
+    def _token(self) -> str:
+        token = os.environ.get("SERIALIZD_TOKEN", "").strip()
+        if token:
+            return token
+
+        try:
+            import keyring
+        except Exception as exc:
+            raise RuntimeError("keyring missing") from exc
+
+        token = keyring.get_password(SERIALIZD_KEYRING_SERVICE, SERIALIZD_KEYRING_TOKEN_USERNAME)
+        if not token:
+            raise RuntimeError("token missing")
+        return token
 
 
 class TargetDispatcher:
@@ -1063,6 +1119,60 @@ def media_event_ids(event: MediaEvent) -> dict[str, object]:
     if not ids:
         raise RuntimeError(f"No Trakt-compatible IDs found for {event.title}")
     return ids
+
+
+def serializd_request(
+    method: str,
+    path: str,
+    token: str | None = None,
+    body: dict[str, object] | None = None,
+) -> object:
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "User-Agent": APP_NAME,
+        "X-Requested-With": "serializd_vercel",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        f"{SERIALIZD_API_BASE_URL}{path}",
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = response.read().decode("utf-8")
+    if not payload:
+        return None
+    return json.loads(payload)
+
+
+def serializd_episode_log_payload(
+    show_id: int,
+    season_id: int,
+    episode_number: int,
+    watched_at: datetime,
+) -> dict[str, object]:
+    return {
+        "show_id": show_id,
+        "season_id": season_id,
+        "review_text": "",
+        "rating": 0,
+        "contains_spoiler": False,
+        "backdate": serializd_backdate(watched_at),
+        "is_log": True,
+        "is_rewatch": False,
+        "episode_number": episode_number,
+        "tags": [],
+        "allows_comments": True,
+        "like": False,
+    }
+
+
+def serializd_backdate(watched_at: datetime) -> str:
+    return watched_at.astimezone().astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def trakt_movie_already_watched(ids: dict[str, object], watched_at: datetime) -> bool:
