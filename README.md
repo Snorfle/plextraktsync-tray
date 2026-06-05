@@ -13,6 +13,7 @@ This was vibe-coded with Codex during a real "please just make Plex and Trakt be
 - opens Plex Web and Trakt directly from the tray menu
 - opens the PlexTraktSync log and config folder
 - restarts the watcher if it exits
+- writes tray diagnostics to `%LOCALAPPDATA%\PlexTraktSync\PlexTraktSync\Logs\plextraktsync-tray.log`
 - checks Trakt auth in the background and alerts if PlexTraktSync's saved token stops working
 - falls back to marking movies watched on Trakt when Plex reports a stopped movie at 90% or later
 
@@ -56,7 +57,7 @@ If PowerShell blocks the script, run this instead:
 powershell -ExecutionPolicy Bypass -File .\install_release.ps1
 ```
 
-The installer creates a normal user Windows logon task named `PlexTraktSync Tray` and starts the tray app. It does not run elevated.
+The installer creates a normal user Windows task named `PlexTraktSync Tray`, adds a `PlexTraktSync Tray` shortcut to your Start menu, and starts the tray app. The task runs at logon and checks every minute that the tray is still running. It does not run elevated.
 
 ### Developer Install
 
@@ -74,8 +75,8 @@ Use this if you want to edit or rebuild the app yourself.
 
 - `plextraktsync_tray.py` - the tray app source
 - `requirements.txt` - tray app dependencies
-- `setup_tray_app.ps1` - creates a venv, builds the app, and registers the logon task from source
-- `install_release.ps1` - registers a packaged release build as a Windows logon task
+- `setup_tray_app.ps1` - creates a venv, builds the app, registers the logon task from source, and adds the Start menu shortcut
+- `install_release.ps1` - registers a packaged release build as a Windows logon task and adds the Start menu shortcut
 - `build_release.ps1` - builds a zip suitable for GitHub Releases
 - `LICENSE` - MIT license
 
@@ -109,6 +110,14 @@ plextraktsync trakt-login
 Use `Check Auth Now` from the tray menu to force the check.
 
 ## Changelog
+
+### v0.3.0
+
+- added a real packaged app icon and Start menu shortcut icon
+- added tray diagnostics at `%LOCALAPPDATA%\PlexTraktSync\PlexTraktSync\Logs\plextraktsync-tray.log`
+- changed the Windows task to check every minute that the tray is still running
+- clean up stale orphan `plextraktsync watch` processes before starting a new tray-managed watcher
+- ignored local Trakt and Serializd CSV exports
 
 ### v0.2.0
 
