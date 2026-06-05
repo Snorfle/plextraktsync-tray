@@ -26,6 +26,8 @@ Cache/
 *.log
 *.sqlite
 *.db
+trakt_*.csv
+serializd_*.csv
 
 # Local editor and OS files
 .vscode/

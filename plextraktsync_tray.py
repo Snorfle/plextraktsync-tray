@@ -1,10 +1,13 @@
 import ctypes
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import signal
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -27,6 +30,7 @@ BASE_DIR = Path(__file__).resolve().parent
 LOCAL_APPDATA = Path(os.environ["LOCALAPPDATA"]) / "PlexTraktSync" / "PlexTraktSync"
 PLEXTRAKTSYNC_PYTHON = Path.home() / "pipx" / "venvs" / "plextraktsync" / "Scripts" / "python.exe"
 LOG_FILE = LOCAL_APPDATA / "Logs" / "plextraktsync.log"
+TRAY_LOG_FILE = LOCAL_APPDATA / "Logs" / "plextraktsync-tray.log"
 PYTRAKT_CONFIG_FILE = LOCAL_APPDATA / ".pytrakt.json"
 SERVERS_CONFIG_FILE = LOCAL_APPDATA / "servers.yml"
 COMPLETED_MOVIE_STATE_FILE = LOCAL_APPDATA / "completed_movie_sync_state.json"
@@ -53,6 +57,67 @@ WATCHED_MOVIE_PATTERN = re.compile(
     r"<(?P<kind>[^:>]+):(?P<rating_key>\d+):(?P<title>.+)>: (?P<progress>\d+(?:\.\d+)?)%, "
     r"State: (?P<state>\w+), Played: (?P<played>True|False)",
 )
+
+
+def setup_logging() -> None:
+    TRAY_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        TRAY_LOG_FILE,
+        maxBytes=1_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s[%(threadName)s]:%(message)s",
+        handlers=[handler],
+    )
+
+    def log_unhandled_exception(exc_type, exc_value, exc_traceback):
+        logging.critical(
+            "Unhandled exception",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
+
+    def log_thread_exception(args: threading.ExceptHookArgs) -> None:
+        logging.critical(
+            "Unhandled thread exception in %s",
+            args.thread.name if args.thread else "unknown thread",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = log_unhandled_exception
+    threading.excepthook = log_thread_exception
+
+
+def cleanup_existing_watchers() -> None:
+    command_line = f"{PLEXTRAKTSYNC_PYTHON} -m plextraktsync watch"
+    escaped_command_line = command_line.replace("'", "''")
+    command = (
+        "$watchers = Get-CimInstance Win32_Process | "
+        f"Where-Object {{ $_.CommandLine -eq '{escaped_command_line}' }}; "
+        "foreach ($watcher in $watchers) { "
+        "Stop-Process -Id $watcher.ProcessId -Force -ErrorAction SilentlyContinue; "
+        "Write-Output $watcher.ProcessId "
+        "}"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        logging.exception("Failed to clean up existing watcher processes")
+        return
+
+    stopped = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if stopped:
+        logging.info("Stopped stale watcher process ids before tray startup: %s", ", ".join(stopped))
+    if result.returncode != 0:
+        logging.warning("Watcher cleanup exited with %s: %s", result.returncode, result.stderr.strip())
 
 @dataclass(frozen=True)
 class WatchedMovieEvent:
@@ -195,8 +260,10 @@ class WatcherManager:
                 return
 
             self.last_start_time = time.time()
+            logging.info("Starting PlexTraktSync watcher")
             if not PLEXTRAKTSYNC_PYTHON.exists():
                 self.last_error = f"Missing watcher Python at {PLEXTRAKTSYNC_PYTHON}"
+                logging.error(self.last_error)
                 raise FileNotFoundError(self.last_error)
 
             # Keep PlexTraktSync in its own pipx-managed environment. The tray app
@@ -217,6 +284,7 @@ class WatcherManager:
                 env=watcher_env,
                 creationflags=CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
             )
+            logging.info("Started PlexTraktSync watcher pid=%s", self.process.pid)
             self.last_error = None
             self.last_connected_at = self.last_start_time
             self.auto_restart = True
@@ -231,15 +299,18 @@ class WatcherManager:
         if process is None:
             return
 
+        logging.info("Stopping PlexTraktSync watcher pid=%s", process.pid)
         if process.poll() is None:
             try:
                 process.send_signal(signal.CTRL_BREAK_EVENT)
                 process.wait(timeout=10)
             except (subprocess.TimeoutExpired, OSError):
+                logging.warning("Watcher did not stop gracefully; terminating pid=%s", process.pid)
                 process.terminate()
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
+                    logging.warning("Watcher did not terminate; killing pid=%s", process.pid)
                     process.kill()
                     process.wait(timeout=5)
 
@@ -1062,17 +1133,22 @@ def main() -> int:
     # is started manually while an instance is already running.
     instance_mutex = kernel32.CreateMutexW(None, False, MUTEX_NAME)
     if not instance_mutex:
+        logging.error("Failed to create tray mutex")
         return 1
     if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        logging.info("Another tray instance is already running; exiting")
         kernel32.CloseHandle(instance_mutex)
         return 0
 
     LOCAL_APPDATA.mkdir(parents=True, exist_ok=True)
+    logging.info("Starting %s from %s pid=%s", APP_NAME, BASE_DIR, os.getpid())
+    cleanup_existing_watchers()
 
     try:
         manager.start()
     except Exception as exc:
         manager.last_error = str(exc)
+        logging.exception("Failed to start PlexTraktSync watcher")
 
     threading.Thread(target=manager.check_versions, daemon=True).start()
     auth_health.check_if_due(force=True)
@@ -1083,8 +1159,17 @@ def main() -> int:
     monitor_thread.start()
 
     tray_icon.run()
+    logging.info("Tray icon loop exited")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    setup_logging()
+    try:
+        exit_code = main()
+    except Exception:
+        logging.exception("Tray app crashed")
+        exit_code = 1
+    finally:
+        logging.info("Exiting %s", APP_NAME)
+    raise SystemExit(exit_code)
