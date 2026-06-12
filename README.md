@@ -113,7 +113,6 @@ Use `Check Auth Now` from the tray menu to force the check.
 - added tray diagnostics at `%LOCALAPPDATA%\PlexTraktSync\PlexTraktSync\Logs\plextraktsync-tray.log`
 - changed the Windows task to check every minute that the tray is still running
 - clean up stale orphan `plextraktsync watch` processes before starting a new tray-managed watcher
-- ignored local Trakt and Serializd CSV exports
 
 ### v0.2.0
 
