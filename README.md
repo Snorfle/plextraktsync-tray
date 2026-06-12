@@ -90,7 +90,7 @@ A movie counts as completed when PlexTraktSync reports `Played: True` or when pl
 
 The tray menu shows a Trakt auth status row.
 
-Trakt is checked by calling the Trakt API with PlexTraktSync's saved `.pytrakt.json` token. If it reports `Trakt auth failed`, run:
+Trakt is checked by calling the Trakt API with PlexTraktSync's saved `.pytrakt.json` token. The tray refreshes OAuth credentials one day before expiry, writes the rotated credentials atomically, and restarts the watcher so it loads the new token. If refresh fails and the tray reports `Trakt auth failed`, run:
 
 ```powershell
 plextraktsync trakt-login
@@ -99,6 +99,13 @@ plextraktsync trakt-login
 Use `Check Auth Now` from the tray menu to force the check.
 
 ## Changelog
+
+### v0.3.1
+
+- refresh Trakt OAuth credentials one day before expiry instead of waiting for PlexTraktSync's final ten-minute window
+- stop the watcher during token rotation to prevent concurrent refresh attempts from invalidating each other
+- write refreshed credentials atomically and restart the watcher so it immediately loads the new token
+- log OAuth refresh attempts, success, and failures in the tray diagnostics log
 
 ### v0.3.0
 
