@@ -44,11 +44,13 @@ PLEX_BASE_URL = "http://127.0.0.1:32400"
 PLEX_WEB_URL = f"{PLEX_BASE_URL}/web"
 TRAKT_WEB_URL = "https://trakt.tv/"
 TRAKT_API_SETTINGS_URL = "https://api.trakt.tv/users/settings"
+TRAKT_OAUTH_TOKEN_URL = "https://api.trakt.tv/oauth/token"
 PYPI_JSON_URL = "https://pypi.org/pypi/plextraktsync/json"
 PLAYBACK_STALE_MINUTES = 30
 WATCHED_PROGRESS_THRESHOLD = 90.0
 TRAKT_AUTH_CHECK_SECONDS = 15 * 60
 TRAKT_AUTH_RETRY_SECONDS = 60
+TRAKT_REFRESH_MARGIN_SECONDS = 24 * 60 * 60
 ON_PLAY_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\[.*?\]:on_play: <[^>]+:(?P<title>.+)>: (?P<progress>\d+(?:\.\d+)?)%, State: (?P<state>\w+)",
 )
@@ -706,7 +708,7 @@ def plex_movie_ids(rating_key: str) -> dict[str, object]:
 
 
 def trakt_headers() -> dict[str, str]:
-    payload = json.loads(PYTRAKT_CONFIG_FILE.read_text(encoding="utf-8"))
+    payload = load_trakt_config()
     client_id = str(payload.get("CLIENT_ID", "")).strip()
     token = str(payload.get("OAUTH_TOKEN", "")).strip()
     if not client_id or not token:
@@ -718,6 +720,79 @@ def trakt_headers() -> dict[str, str]:
         "trakt-api-version": "2",
         "User-Agent": APP_NAME,
     }
+
+
+trakt_config_lock = threading.Lock()
+
+
+def load_trakt_config() -> dict[str, object]:
+    with trakt_config_lock:
+        return json.loads(PYTRAKT_CONFIG_FILE.read_text(encoding="utf-8"))
+
+
+def store_trakt_config(payload: dict[str, object]) -> None:
+    PYTRAKT_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = PYTRAKT_CONFIG_FILE.with_suffix(".json.tmp")
+    with trakt_config_lock:
+        temp_path.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temp_path, PYTRAKT_CONFIG_FILE)
+
+
+def trakt_token_needs_refresh(payload: dict[str, object]) -> bool:
+    try:
+        expires_at = int(payload.get("OAUTH_EXPIRES_AT", 0))
+    except (TypeError, ValueError):
+        return True
+    return expires_at <= int(time.time()) + TRAKT_REFRESH_MARGIN_SECONDS
+
+
+def refresh_trakt_token(payload: dict[str, object]) -> dict[str, object]:
+    client_id = str(payload.get("CLIENT_ID", "")).strip()
+    client_secret = str(payload.get("CLIENT_SECRET", "")).strip()
+    refresh_token = str(payload.get("OAUTH_REFRESH", "")).strip()
+    if not client_id or not client_secret or not refresh_token:
+        raise RuntimeError("refresh credentials missing")
+
+    body = json.dumps(
+        {
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+            "grant_type": "refresh_token",
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        TRAKT_OAUTH_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": APP_NAME},
+        method="POST",
+    )
+    logging.info("Refreshing Trakt OAuth token before expiry")
+    with urllib.request.urlopen(request, timeout=20) as response:
+        refreshed = json.loads(response.read().decode("utf-8"))
+
+    access_token = str(refreshed.get("access_token", "")).strip()
+    new_refresh_token = str(refreshed.get("refresh_token", "")).strip()
+    created_at = int(refreshed.get("created_at", 0))
+    expires_in = int(refreshed.get("expires_in", 0))
+    if not access_token or not new_refresh_token or not created_at or not expires_in:
+        raise RuntimeError("refresh response incomplete")
+
+    updated = dict(payload)
+    updated.update(
+        {
+            "OAUTH_TOKEN": access_token,
+            "OAUTH_REFRESH": new_refresh_token,
+            "OAUTH_EXPIRES_AT": created_at + expires_in,
+        }
+    )
+    store_trakt_config(updated)
+    expires_local = datetime.fromtimestamp(
+        created_at + expires_in, tz=timezone.utc
+    ).astimezone()
+    logging.info("Trakt OAuth token refreshed; valid until %s", expires_local.isoformat())
+    return updated
 
 
 def mark_trakt_movie_watched(event: WatchedMovieEvent) -> None:
@@ -818,29 +893,65 @@ class AuthHealth:
     def _check_trakt(self, notify_success: bool = False) -> None:
         self.last_trakt_check = time.time()
         try:
-            payload = json.loads(PYTRAKT_CONFIG_FILE.read_text(encoding="utf-8"))
+            payload = load_trakt_config()
+            if trakt_token_needs_refresh(payload):
+                payload = self._refresh_trakt_credentials(payload)
+
             client_id = str(payload.get("CLIENT_ID", "")).strip()
             token = str(payload.get("OAUTH_TOKEN", "")).strip()
             if not client_id or not token:
                 raise RuntimeError("token missing")
 
-            request = urllib.request.Request(
-                TRAKT_API_SETTINGS_URL,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                    "trakt-api-key": client_id,
-                    "trakt-api-version": "2",
-                    "User-Agent": APP_NAME,
-                },
-            )
-            with urllib.request.urlopen(request, timeout=20) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"HTTP {response.status}")
+            try:
+                self._request_trakt_settings(client_id, token)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 401:
+                    raise
+                logging.warning("Trakt rejected the access token; attempting refresh")
+                payload = self._refresh_trakt_credentials(payload)
+                self._request_trakt_settings(
+                    str(payload["CLIENT_ID"]),
+                    str(payload["OAUTH_TOKEN"]),
+                )
 
             self._set_trakt(True, "Trakt: auth ok", notify_success=notify_success)
         except Exception as exc:
+            logging.exception("Trakt authentication health check failed")
             self._set_trakt(False, f"Trakt auth failed: {friendly_error(exc)}")
+
+    @staticmethod
+    def _refresh_trakt_credentials(payload: dict[str, object]) -> dict[str, object]:
+        watcher_was_running = manager.is_running()
+        auto_restart_was_enabled = manager.auto_restart
+        if watcher_was_running:
+            logging.info("Stopping watcher before Trakt OAuth refresh")
+            manager.auto_restart = False
+            manager.stop()
+        try:
+            return refresh_trakt_token(payload)
+        finally:
+            if watcher_was_running:
+                logging.info("Restarting watcher after Trakt OAuth refresh")
+                try:
+                    manager.start()
+                finally:
+                    manager.auto_restart = auto_restart_was_enabled
+
+    @staticmethod
+    def _request_trakt_settings(client_id: str, token: str) -> None:
+        request = urllib.request.Request(
+            TRAKT_API_SETTINGS_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "trakt-api-key": client_id,
+                "trakt-api-version": "2",
+                "User-Agent": APP_NAME,
+            },
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status != 200:
+                raise RuntimeError(f"HTTP {response.status}")
 
     def _set_trakt(self, ok: bool, status: str, notify_success: bool = False) -> None:
         previous = self.trakt_ok
