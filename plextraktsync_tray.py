@@ -47,14 +47,26 @@ PLEX_BASE_URL = "http://127.0.0.1:32400"
 PLEX_WEB_URL = f"{PLEX_BASE_URL}/web"
 TRAKT_WEB_URL = "https://trakt.tv/"
 TRAKT_API_SETTINGS_URL = "https://api.trakt.tv/users/settings"
+TRAKT_OAUTH_TOKEN_URL = "https://api.trakt.tv/oauth/token"
 SERIALIZD_API_BASE_URL = "https://serializd.onrender.com"
 SERIALIZD_KEYRING_SERVICE = "StreamingHistorySync.Serializd"
 SERIALIZD_KEYRING_TOKEN_USERNAME = "oauth"
+SIMKL_API_BASE_URL = "https://api.simkl.com"
+SIMKL_WEB_URL = "https://simkl.com/"
+SIMKL_PIN_URL = "https://simkl.com/pin"
+SIMKL_CONFIG_FILE = LOCAL_APPDATA / "simkl_target.json"
+SIMKL_KEYRING_SERVICE = "PlexTraktSyncTray.Simkl"
+SIMKL_KEYRING_TOKEN_USERNAME = "oauth"
+SIMKL_DEFAULT_CLIENT_ID = ""
+SIMKL_APP_VERSION = "0.1.0-experimental"
 PYPI_JSON_URL = "https://pypi.org/pypi/plextraktsync/json"
 PLAYBACK_STALE_MINUTES = 30
 WATCHED_PROGRESS_THRESHOLD = 90.0
 TRAKT_AUTH_CHECK_SECONDS = 15 * 60
 TRAKT_AUTH_RETRY_SECONDS = 60
+TRAKT_REFRESH_MARGIN_SECONDS = 24 * 60 * 60
+SIMKL_POST_INTERVAL_SECONDS = 1.05
+SIMKL_RETRYABLE_HTTP_CODES = {429, 500, 502, 503}
 ON_PLAY_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\[.*?\]:on_play: <[^>]+:(?P<title>.+)>: (?P<progress>\d+(?:\.\d+)?)%, State: (?P<state>\w+)",
 )
@@ -446,6 +458,250 @@ class SerializdTarget(SyncTarget):
         return token
 
 
+class SimklIntegration:
+    """Owns Simkl config, PIN login, and credential storage."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.pin_thread: threading.Thread | None = None
+        self.pin_code: str | None = None
+        self.last_status = "Simkl: not connected"
+        self.account_username: str | None = None
+        self.auth_failed = False
+
+    def client_id(self) -> str:
+        configured = os.environ.get("SIMKL_CLIENT_ID", "").strip()
+        if configured:
+            return configured
+        payload = self.load_config()
+        return str(payload.get("client_id") or SIMKL_DEFAULT_CLIENT_ID).strip()
+
+    def is_enabled(self) -> bool:
+        if os.environ.get("SIMKL_TOKEN", "").strip():
+            return True
+        payload = self.load_config()
+        return bool(payload.get("enabled", False))
+
+    def token(self) -> str:
+        token = os.environ.get("SIMKL_TOKEN", "").strip()
+        if token:
+            return token
+
+        try:
+            import keyring
+        except Exception as exc:
+            raise RuntimeError("keyring missing") from exc
+
+        token = keyring.get_password(SIMKL_KEYRING_SERVICE, SIMKL_KEYRING_TOKEN_USERNAME)
+        if not token:
+            raise RuntimeError("token missing")
+        return token
+
+    def is_configured(self) -> bool:
+        try:
+            return bool(self.client_id()) and self.is_enabled() and bool(self.token())
+        except Exception:
+            return False
+
+    def status_text(self) -> str:
+        with self.lock:
+            return self.last_status
+
+    def refresh_status(self) -> None:
+        with self.lock:
+            pin_code = self.pin_code
+            username = self.account_username
+            auth_failed = self.auth_failed
+        if not username:
+            configured_username = self.load_config().get("username")
+            username = str(configured_username).strip() if configured_username else None
+        if pin_code:
+            self._set_status(f"Simkl: waiting for PIN {pin_code}")
+        elif auth_failed:
+            self._set_status("Simkl: auth failed")
+        elif self.is_enabled() and self.client_id():
+            try:
+                self.token()
+            except Exception as exc:
+                self._set_status(f"Simkl: not connected ({friendly_error(exc)})")
+            else:
+                self._set_status(f"Simkl: connected as {username}" if username else "Simkl: connected")
+        elif not self.client_id():
+            self._set_status("Simkl: client id missing")
+        else:
+            self._set_status("Simkl: not connected")
+
+    def connect(self) -> None:
+        with self.lock:
+            if self.pin_thread and self.pin_thread.is_alive():
+                notify_message(self.last_status)
+                return
+        if not self.client_id():
+            notify_message("Set SIMKL_CLIENT_ID or add a Simkl client_id in simkl_target.json first.")
+            self._set_status("Simkl: client id missing")
+            refresh_icon()
+            return
+
+        thread = threading.Thread(target=self._pin_login, daemon=True)
+        with self.lock:
+            self.pin_thread = thread
+            self.auth_failed = False
+        thread.start()
+
+    def disconnect(self) -> None:
+        try:
+            import keyring
+
+            keyring.delete_password(SIMKL_KEYRING_SERVICE, SIMKL_KEYRING_TOKEN_USERNAME)
+        except Exception:
+            pass
+        payload = self.load_config()
+        payload.update({"enabled": False, "account_id": None, "username": None, "account_type": None})
+        self.save_config(payload)
+        with self.lock:
+            self.pin_code = None
+            self.account_username = None
+            self.auth_failed = False
+        self.refresh_status()
+        notify_message("Simkl disconnected.")
+        refresh_icon()
+
+    def _pin_login(self) -> None:
+        try:
+            payload = simkl_request("GET", "/oauth/pin", token=None, client_id=self.client_id())
+            if not isinstance(payload, dict):
+                raise RuntimeError("PIN response invalid")
+            user_code = str(payload.get("user_code", "")).strip()
+            if not user_code:
+                raise RuntimeError("PIN response missing code")
+            interval = max(5, int_or_none(payload.get("interval")) or 5)
+            expires_in = max(60, int_or_none(payload.get("expires_in")) or 900)
+            deadline = time.time() + expires_in
+            with self.lock:
+                self.pin_code = user_code
+            self._set_status(f"Simkl: waiting for PIN {user_code}")
+            notify_message(f"Connect Simkl with PIN {user_code}.")
+            webbrowser.open(SIMKL_PIN_URL)
+            refresh_icon()
+
+            while time.time() < deadline and not shutdown_event.is_set():
+                time.sleep(interval)
+                poll_payload = simkl_request("GET", f"/oauth/pin/{urllib.parse.quote(user_code)}", token=None, client_id=self.client_id())
+                if isinstance(poll_payload, dict) and str(poll_payload.get("result", "")).upper() == "KO":
+                    continue
+                if isinstance(poll_payload, dict) and poll_payload.get("user_code") and not poll_payload.get("access_token"):
+                    raise RuntimeError("PIN was replaced before authorization")
+                token = str(poll_payload.get("access_token", "")).strip() if isinstance(poll_payload, dict) else ""
+                if token:
+                    self._store_token(token)
+                    settings = simkl_request("POST", "/users/settings", token=token, client_id=self.client_id(), body={})
+                    username = simkl_username_from_settings(settings)
+                    payload = self.load_config()
+                    payload.update(
+                        {
+                            "enabled": True,
+                            "account_id": simkl_account_id_from_settings(settings),
+                            "username": username,
+                            "account_type": simkl_account_type_from_settings(settings),
+                        }
+                    )
+                    self.save_config(payload)
+                    with self.lock:
+                        self.pin_code = None
+                        self.account_username = username
+                        self.auth_failed = False
+                    self.refresh_status()
+                    notify_message("Simkl connected.")
+                    refresh_icon()
+                    return
+
+            raise RuntimeError("PIN expired")
+        except Exception as exc:
+            logging.exception("Simkl PIN login failed")
+            with self.lock:
+                self.pin_code = None
+                self.auth_failed = True
+            self._set_status(f"Simkl auth failed: {friendly_error(exc)}")
+            notify_message(f"Simkl connection failed: {friendly_error(exc)}.")
+            refresh_icon()
+
+    @staticmethod
+    def _store_token(token: str) -> None:
+        try:
+            import keyring
+        except Exception as exc:
+            raise RuntimeError("keyring missing") from exc
+        keyring.set_password(SIMKL_KEYRING_SERVICE, SIMKL_KEYRING_TOKEN_USERNAME, token)
+
+    def load_config(self) -> dict[str, object]:
+        try:
+            payload = json.loads(SIMKL_CONFIG_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        if "enabled" not in payload:
+            payload["enabled"] = False
+        if "client_id" not in payload:
+            payload["client_id"] = SIMKL_DEFAULT_CLIENT_ID
+        return payload
+
+    def save_config(self, payload: dict[str, object]) -> None:
+        SIMKL_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = SIMKL_CONFIG_FILE.with_suffix(".json.tmp")
+        temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(temp_path, SIMKL_CONFIG_FILE)
+
+    def _set_status(self, status: str) -> None:
+        with self.lock:
+            self.last_status = status
+
+
+class SimklTarget(SyncTarget):
+    name = "simkl"
+
+    def __init__(self, integration: SimklIntegration) -> None:
+        self.integration = integration
+        self.last_status = "Simkl: not checked"
+
+    def is_configured(self) -> bool:
+        try:
+            configured = self.integration.is_configured()
+        except Exception as exc:
+            self.last_status = f"Simkl: not configured ({friendly_error(exc)})"
+            return False
+        self.integration.refresh_status()
+        self.last_status = self.integration.status_text()
+        return configured
+
+    def applies_to(self, event: MediaEvent) -> bool:
+        return event.content_type in {"movie", "episode"}
+
+    def status_text(self) -> str:
+        self.integration.refresh_status()
+        return self.integration.status_text()
+
+    def sync(self, event: MediaEvent) -> str:
+        token = self.integration.token()
+        client_id = self.integration.client_id()
+        if event.content_type == "episode" and (event.season_number is None or event.episode_number is None):
+            self.last_status = "Simkl: episode numbers missing"
+            return "blocked"
+        try:
+            ids = media_event_ids(event)
+        except RuntimeError:
+            self.last_status = "Simkl: external IDs missing"
+            return "blocked"
+
+        if simkl_already_watched(event, ids, token, client_id):
+            self.last_status = "Simkl: already present"
+            return "already_present"
+
+        payload = simkl_history_payload(event, ids)
+        response = simkl_request("POST", "/sync/history", token=token, client_id=client_id, body=payload)
+        simkl_validate_history_response(event, response)
+        self.last_status = "Simkl: synced"
+        return "synced"
+
+
 class TargetDispatcher:
     def __init__(self, targets: list[SyncTarget]) -> None:
         self.targets = targets
@@ -580,7 +836,7 @@ class CompletedMediaSync:
                     response_summary=friendly_error(exc),
                 )
             self.last_status = f"Target sync failed: {friendly_error(exc)}"
-            notify_message(f"Trakt watched fallback failed: {friendly_error(exc)}.")
+            notify_message(f"Target sync failed: {friendly_error(exc)}.")
         finally:
             with self.lock:
                 self.running = False
@@ -846,7 +1102,9 @@ manager = WatcherManager()
 target_ledger = TargetLedger(TARGET_SYNC_LEDGER_FILE)
 trakt_target = TraktTarget()
 serializd_target = SerializdTarget()
-target_dispatcher = TargetDispatcher([trakt_target, serializd_target])
+simkl_integration = SimklIntegration()
+simkl_target = SimklTarget(simkl_integration)
+target_dispatcher = TargetDispatcher([trakt_target, serializd_target, simkl_target])
 completed_media_sync = CompletedMediaSync(LOG_FILE, target_ledger, target_dispatcher, LEGACY_COMPLETED_MOVIE_STATE_FILE)
 tray_icon: pystray.Icon | None = None
 shutdown_event = threading.Event()
@@ -1138,7 +1396,7 @@ def int_or_none(value: object) -> int | None:
 
 
 def trakt_headers() -> dict[str, str]:
-    payload = json.loads(PYTRAKT_CONFIG_FILE.read_text(encoding="utf-8"))
+    payload = load_trakt_config()
     client_id = str(payload.get("CLIENT_ID", "")).strip()
     token = str(payload.get("OAUTH_TOKEN", "")).strip()
     if not client_id or not token:
@@ -1150,6 +1408,79 @@ def trakt_headers() -> dict[str, str]:
         "trakt-api-version": "2",
         "User-Agent": APP_NAME,
     }
+
+
+trakt_config_lock = threading.Lock()
+
+
+def load_trakt_config() -> dict[str, object]:
+    with trakt_config_lock:
+        return json.loads(PYTRAKT_CONFIG_FILE.read_text(encoding="utf-8"))
+
+
+def store_trakt_config(payload: dict[str, object]) -> None:
+    PYTRAKT_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = PYTRAKT_CONFIG_FILE.with_suffix(".json.tmp")
+    with trakt_config_lock:
+        temp_path.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temp_path, PYTRAKT_CONFIG_FILE)
+
+
+def trakt_token_needs_refresh(payload: dict[str, object]) -> bool:
+    try:
+        expires_at = int(payload.get("OAUTH_EXPIRES_AT", 0))
+    except (TypeError, ValueError):
+        return True
+    return expires_at <= int(time.time()) + TRAKT_REFRESH_MARGIN_SECONDS
+
+
+def refresh_trakt_token(payload: dict[str, object]) -> dict[str, object]:
+    client_id = str(payload.get("CLIENT_ID", "")).strip()
+    client_secret = str(payload.get("CLIENT_SECRET", "")).strip()
+    refresh_token = str(payload.get("OAUTH_REFRESH", "")).strip()
+    if not client_id or not client_secret or not refresh_token:
+        raise RuntimeError("refresh credentials missing")
+
+    body = json.dumps(
+        {
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+            "grant_type": "refresh_token",
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        TRAKT_OAUTH_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": APP_NAME},
+        method="POST",
+    )
+    logging.info("Refreshing Trakt OAuth token before expiry")
+    with urllib.request.urlopen(request, timeout=20) as response:
+        refreshed = json.loads(response.read().decode("utf-8"))
+
+    access_token = str(refreshed.get("access_token", "")).strip()
+    new_refresh_token = str(refreshed.get("refresh_token", "")).strip()
+    created_at = int(refreshed.get("created_at", 0))
+    expires_in = int(refreshed.get("expires_in", 0))
+    if not access_token or not new_refresh_token or not created_at or not expires_in:
+        raise RuntimeError("refresh response incomplete")
+
+    updated = dict(payload)
+    updated.update(
+        {
+            "OAUTH_TOKEN": access_token,
+            "OAUTH_REFRESH": new_refresh_token,
+            "OAUTH_EXPIRES_AT": created_at + expires_in,
+        }
+    )
+    store_trakt_config(updated)
+    expires_local = datetime.fromtimestamp(
+        created_at + expires_in, tz=timezone.utc
+    ).astimezone()
+    logging.info("Trakt OAuth token refreshed; valid until %s", expires_local.isoformat())
+    return updated
 
 
 def mark_trakt_movie_watched(event: MediaEvent) -> str:
@@ -1190,6 +1521,218 @@ def media_event_ids(event: MediaEvent) -> dict[str, object]:
     if not ids:
         raise RuntimeError(f"No Trakt-compatible IDs found for {event.title}")
     return ids
+
+
+simkl_post_lock = threading.Lock()
+simkl_last_post_at = 0.0
+
+
+def simkl_request(
+    method: str,
+    path: str,
+    token: str | None,
+    client_id: str,
+    body: dict[str, object] | None = None,
+) -> object:
+    if not client_id:
+        raise RuntimeError("Simkl client id missing")
+
+    params = {
+        "client_id": client_id,
+        "app-name": APP_NAME,
+        "app-version": SIMKL_APP_VERSION,
+    }
+    url = f"{SIMKL_API_BASE_URL}{path}?{urllib.parse.urlencode(params)}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": f"{APP_NAME}/{SIMKL_APP_VERSION}",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    attempts = 5 if method == "POST" else 3
+    for attempt in range(attempts):
+        if method == "POST":
+            simkl_wait_for_post_slot()
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = response.read().decode("utf-8")
+                if not payload:
+                    return None
+                return json.loads(payload)
+        except urllib.error.HTTPError as exc:
+            error_payload = simkl_error_payload(exc)
+            retry_after = int_or_none(exc.headers.get("Retry-After"))
+            if simkl_should_retry(exc.code, error_payload) and attempt + 1 < attempts:
+                time.sleep(retry_after or min(60, 2**attempt))
+                continue
+            if exc.code == 401:
+                simkl_integration.auth_failed = True
+            raise
+
+    raise RuntimeError("Simkl request failed")
+
+
+def simkl_wait_for_post_slot() -> None:
+    global simkl_last_post_at
+    with simkl_post_lock:
+        elapsed = time.time() - simkl_last_post_at
+        if elapsed < SIMKL_POST_INTERVAL_SECONDS:
+            time.sleep(SIMKL_POST_INTERVAL_SECONDS - elapsed)
+        simkl_last_post_at = time.time()
+
+
+def simkl_error_payload(exc: urllib.error.HTTPError) -> object:
+    try:
+        text = exc.read().decode("utf-8")
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def simkl_should_retry(status_code: int, error_payload: object) -> bool:
+    if status_code in SIMKL_RETRYABLE_HTTP_CODES:
+        return True
+    if status_code == 400 and isinstance(error_payload, dict):
+        return str(error_payload.get("error", "")).upper() == "RATE_LIMIT"
+    return False
+
+
+def simkl_history_payload(event: MediaEvent, ids: dict[str, object]) -> dict[str, object]:
+    watched_at = event.watched_at.astimezone().astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    if event.content_type == "movie":
+        return {"movies": [{"ids": ids, "watched_at": watched_at}]}
+    return {
+        "shows": [
+            {
+                "ids": ids,
+                "seasons": [
+                    {
+                        "number": event.season_number,
+                        "episodes": [
+                            {
+                                "number": event.episode_number,
+                                "watched_at": watched_at,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def simkl_watched_payload(event: MediaEvent, ids: dict[str, object]) -> dict[str, object]:
+    if event.content_type == "movie":
+        return {"movies": [{"ids": ids}]}
+    return {
+        "shows": [
+            {
+                "ids": ids,
+                "seasons": [
+                    {
+                        "number": event.season_number,
+                        "episodes": [{"number": event.episode_number}],
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def simkl_already_watched(event: MediaEvent, ids: dict[str, object], token: str, client_id: str) -> bool:
+    payload = simkl_watched_payload(event, ids)
+    response = simkl_request("POST", "/sync/watched", token=token, client_id=client_id, body=payload)
+    if not isinstance(response, dict):
+        return False
+    if simkl_response_has_not_found(response):
+        return False
+    return simkl_response_reports_item(response, event)
+
+
+def simkl_validate_history_response(event: MediaEvent, response: object) -> None:
+    if not isinstance(response, dict):
+        raise RuntimeError("Simkl response invalid")
+    if simkl_response_has_not_found(response):
+        raise RuntimeError("Simkl did not find the media item")
+    if not simkl_response_reports_item(response, event):
+        raise RuntimeError("Simkl response did not confirm the item")
+
+
+def simkl_response_has_not_found(response: dict[str, object]) -> bool:
+    not_found = response.get("not_found")
+    if isinstance(not_found, dict):
+        return any(bool(value) for value in not_found.values())
+    if isinstance(not_found, list):
+        return bool(not_found)
+    return False
+
+
+def simkl_response_reports_item(response: dict[str, object], event: MediaEvent) -> bool:
+    key = "movies" if event.content_type == "movie" else "episodes"
+    top_result = response.get("result")
+    if event.content_type == "movie" and isinstance(top_result, bool):
+        return top_result
+    for container_key in ("added", "result"):
+        container = response.get(container_key)
+        if isinstance(container, dict):
+            value = container.get(key)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, int):
+                return value > 0
+            if isinstance(value, list):
+                return bool(value)
+    value = response.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value > 0
+    if isinstance(value, list):
+        return bool(value)
+    return False
+
+
+def simkl_username_from_settings(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    user = payload.get("user")
+    if isinstance(user, dict):
+        for key in ("name", "username", "slug"):
+            value = str(user.get(key, "")).strip()
+            if value:
+                return value
+    for key in ("username", "name"):
+        value = str(payload.get(key, "")).strip()
+        if value:
+            return value
+    return None
+
+
+def simkl_account_id_from_settings(payload: object) -> object:
+    if isinstance(payload, dict):
+        user = payload.get("user")
+        if isinstance(user, dict):
+            return user.get("id")
+        return payload.get("id")
+    return None
+
+
+def simkl_account_type_from_settings(payload: object) -> object:
+    if isinstance(payload, dict):
+        account = payload.get("account")
+        if isinstance(account, dict):
+            return account.get("type")
+        return payload.get("account_type")
+    return None
 
 
 def serializd_request(
@@ -1318,29 +1861,53 @@ class AuthHealth:
     def _check_trakt(self, notify_success: bool = False) -> None:
         self.last_trakt_check = time.time()
         try:
-            payload = json.loads(PYTRAKT_CONFIG_FILE.read_text(encoding="utf-8"))
+            payload = load_trakt_config()
+            refreshed = False
+            if trakt_token_needs_refresh(payload):
+                payload = refresh_trakt_token(payload)
+                refreshed = True
+
             client_id = str(payload.get("CLIENT_ID", "")).strip()
             token = str(payload.get("OAUTH_TOKEN", "")).strip()
             if not client_id or not token:
                 raise RuntimeError("token missing")
 
-            request = urllib.request.Request(
-                TRAKT_API_SETTINGS_URL,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                    "trakt-api-key": client_id,
-                    "trakt-api-version": "2",
-                    "User-Agent": APP_NAME,
-                },
-            )
-            with urllib.request.urlopen(request, timeout=20) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"HTTP {response.status}")
+            try:
+                self._request_trakt_settings(client_id, token)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 401 or refreshed:
+                    raise
+                logging.warning("Trakt rejected the access token; attempting refresh")
+                payload = refresh_trakt_token(payload)
+                self._request_trakt_settings(
+                    str(payload["CLIENT_ID"]),
+                    str(payload["OAUTH_TOKEN"]),
+                )
+                refreshed = True
 
             self._set_trakt(True, "Trakt: auth ok", notify_success=notify_success)
+            if refreshed and manager.is_running():
+                logging.info("Restarting watcher to load refreshed Trakt credentials")
+                manager.restart()
         except Exception as exc:
+            logging.exception("Trakt authentication health check failed")
             self._set_trakt(False, f"Trakt auth failed: {friendly_error(exc)}")
+
+    @staticmethod
+    def _request_trakt_settings(client_id: str, token: str) -> None:
+        request = urllib.request.Request(
+            TRAKT_API_SETTINGS_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "trakt-api-key": client_id,
+                "trakt-api-version": "2",
+                "User-Agent": APP_NAME,
+            },
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status != 200:
+                raise RuntimeError(f"HTTP {response.status}")
 
     def _set_trakt(self, ok: bool, status: str, notify_success: bool = False) -> None:
         previous = self.trakt_ok
@@ -1506,6 +2073,10 @@ def open_trakt_web() -> None:
     webbrowser.open(TRAKT_WEB_URL)
 
 
+def open_simkl_web() -> None:
+    webbrowser.open(SIMKL_WEB_URL)
+
+
 def on_start(_: pystray.Icon, __: Item) -> None:
     try:
         manager.paused = False
@@ -1547,6 +2118,20 @@ def on_open_plex(_: pystray.Icon, __: Item) -> None:
 
 def on_open_trakt(_: pystray.Icon, __: Item) -> None:
     open_trakt_web()
+
+
+def on_open_simkl(_: pystray.Icon, __: Item) -> None:
+    open_simkl_web()
+
+
+def on_connect_simkl(_: pystray.Icon, __: Item) -> None:
+    simkl_integration.connect()
+    refresh_icon()
+
+
+def on_disconnect_simkl(_: pystray.Icon, __: Item) -> None:
+    simkl_integration.disconnect()
+    refresh_icon()
 
 
 def on_pause_resume(_: pystray.Icon, __: Item) -> None:
@@ -1603,6 +2188,7 @@ def build_menu() -> pystray.Menu:
         Item(lambda _: manager.update_text(), None, enabled=False),
         Item(lambda _: auth_health.trakt_text(), None, enabled=False),
         Item(lambda _: serializd_target.status_text(), None, enabled=False),
+        Item(lambda _: simkl_target.status_text(), None, enabled=False),
         Item(lambda _: completed_media_sync.status_text(), None, enabled=False),
         Item(lambda _: target_ledger.target_status_text(), None, enabled=False),
         Item(lambda _: target_ledger.target_summary_text(), None, enabled=False),
@@ -1613,9 +2199,12 @@ def build_menu() -> pystray.Menu:
         Item("Restart Watcher", on_restart),
         Item(lambda _: manager.update_action_text(), on_update_plextraktsync, enabled=lambda _: not manager.updating and not manager.version_checking),
         Item("Check Auth Now", on_check_auth, enabled=lambda _: not auth_health.running),
+        Item("Connect Simkl", on_connect_simkl, enabled=lambda _: not simkl_integration.is_configured()),
+        Item("Disconnect Simkl", on_disconnect_simkl, enabled=lambda _: simkl_integration.is_configured()),
         Item(lambda _: "Disable Start With Windows" if startup_cache.get() else "Enable Start With Windows", on_toggle_startup),
         Item("Open Plex Web", on_open_plex),
         Item("Open Trakt", on_open_trakt),
+        Item("Open Simkl", on_open_simkl),
         Item("Open Log", on_open_log),
         Item("Open Config Folder", on_open_config),
         Item("Exit", on_exit),

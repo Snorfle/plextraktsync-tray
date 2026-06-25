@@ -96,6 +96,26 @@ This branch includes experimental target dispatchers:
 
 - Trakt writes the existing missed-movie fallback only.
 - Serializd writes completed episodes when a bearer token is available from `SERIALIZD_TOKEN` or the existing Streaming History Sync Serializd token in Windows Credential Manager.
+- Simkl writes completed movies and episodes through Simkl's official API when a Simkl client ID and user token are configured.
+
+### Experimental Simkl Target
+
+Simkl support is opt-in on this experimental branch. It is not part of the normal `main` release line.
+
+To try it as a developer:
+
+1. Register a Simkl application and set its client ID:
+
+```powershell
+$env:SIMKL_CLIENT_ID = "your-client-id"
+```
+
+2. Start the tray and choose `Connect Simkl`.
+3. Approve the PIN in the browser window that opens.
+
+The tray stores the Simkl access token in Windows Credential Manager under `PlexTraktSyncTray.Simkl`. Non-secret Simkl settings live in `%LOCALAPPDATA%\PlexTraktSync\PlexTraktSync\simkl_target.json`.
+
+The Simkl target checks whether the exact movie or episode is already watched before writing history. It preserves the Plex completion timestamp and records the result in the local target ledger under `simkl`.
 
 ## Auth Health Checks
 
@@ -110,6 +130,12 @@ plextraktsync trakt-login
 Use `Check Auth Now` from the tray menu to force the check.
 
 ## Changelog
+
+### Experimental Simkl branch
+
+- added an opt-in Simkl target using Simkl's official API
+- added Simkl PIN connection, Credential Manager token storage, and disconnect support
+- records Simkl target outcomes in the multi-target ledger
 
 ### v0.3.0
 
