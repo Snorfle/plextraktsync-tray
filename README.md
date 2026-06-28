@@ -41,8 +41,8 @@ plextraktsync login
 
 Steps:
 
-1. Go to the [latest release](https://github.com/Snorfle/plextraktsync-tray/releases/latest).
-2. Download `PlexTraktSyncTray-*.zip`.
+1. Go to the experimental Simkl prerelease or build this branch locally.
+2. Download `PlexTraktSyncTrayExperimental-*.zip`.
 3. Extract the zip somewhere you want the app to live.
 4. Open PowerShell in the extracted folder.
 5. Run:
@@ -57,7 +57,9 @@ If PowerShell blocks the script, run this instead:
 powershell -ExecutionPolicy Bypass -File .\install_release.ps1
 ```
 
-The installer creates a normal user Windows task named `PlexTraktSync Tray`, adds a `PlexTraktSync Tray` shortcut to your Start menu, and starts the tray app. The task runs at logon and checks every minute that the tray is still running. It does not run elevated.
+The installer creates a normal user Windows task named `PlexTraktSync Tray Experimental`, adds a `PlexTraktSync Tray Experimental` shortcut to your Start menu, and starts the tray app. The task runs at logon and checks every minute that the tray is still running. It does not run elevated.
+
+This experimental build uses a separate app identity from the normal tray release. It does not replace the normal `PlexTraktSync Tray` scheduled task or Start menu shortcut.
 
 ### Developer Install
 
@@ -113,9 +115,23 @@ $env:SIMKL_CLIENT_ID = "your-client-id"
 2. Start the tray and choose `Connect Simkl`.
 3. Approve the PIN in the browser window that opens.
 
-The tray stores the Simkl access token in Windows Credential Manager under `PlexTraktSyncTray.Simkl`. Non-secret Simkl settings live in `%LOCALAPPDATA%\PlexTraktSync\PlexTraktSync\simkl_target.json`.
+The tray stores the Simkl access token in Windows Credential Manager under `PlexTraktSyncTrayExperimental.Simkl`. Non-secret Simkl settings live in `%LOCALAPPDATA%\PlexTraktSyncTrayExperimental\simkl_target.json`.
 
 The Simkl target checks whether the exact movie or episode is already watched before writing history. It preserves the Plex completion timestamp and records the result in the local target ledger under `simkl`.
+
+### Experimental Build Identity
+
+The Simkl branch intentionally uses separate Windows identity anchors:
+
+- app name: `PlexTraktSync Tray Experimental`
+- scheduled task: `PlexTraktSync Tray Experimental`
+- Start menu shortcut: `PlexTraktSync Tray Experimental`
+- packaged app folder/exe: `PlexTraktSyncTrayExperimental`
+- app mutex: `PlexTraktSyncTrayExperimentalApp`
+- Simkl Credential Manager service: `PlexTraktSyncTrayExperimental.Simkl`
+- tray diagnostics and target ledger: `%LOCALAPPDATA%\PlexTraktSyncTrayExperimental`
+
+It still reads PlexTraktSync's existing watch log and config from `%LOCALAPPDATA%\PlexTraktSync\PlexTraktSync`, because those belong to the underlying PlexTraktSync install.
 
 ## Auth Health Checks
 
@@ -136,6 +152,7 @@ Use `Check Auth Now` from the tray menu to force the check.
 - added an opt-in Simkl target using Simkl's official API
 - added Simkl PIN connection, Credential Manager token storage, and disconnect support
 - records Simkl target outcomes in the multi-target ledger
+- split the experimental Windows app identity from the normal tray release
 
 ### v0.3.0
 
@@ -163,6 +180,6 @@ Use `Check Auth Now` from the tray menu to force the check.
 
 - The tray app uses your existing `pipx` install of `PlexTraktSync`.
 - The update tray action checks the installed PlexTraktSync version against PyPI. When an update is available, it runs `pipx upgrade plextraktsync` and restarts the watcher.
-- The Windows scheduled task created by setup is named `PlexTraktSync Tray`.
+- The Windows scheduled task created by setup is named `PlexTraktSync Tray Experimental` on this branch.
 - The scheduled task launches the packaged executable, not the Python script directly.
 - Do not commit your PlexTraktSync `.env`, `.pytrakt.json`, `servers.yml`, logs, cache, or packaged build output.

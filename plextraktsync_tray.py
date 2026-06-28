@@ -26,15 +26,16 @@ from PIL import Image, ImageDraw
 from pystray import MenuItem as Item
 
 
-APP_NAME = "PlexTraktSync Tray"
-TASK_NAME = "PlexTraktSync Tray"
+APP_NAME = "PlexTraktSync Tray Experimental"
+TASK_NAME = "PlexTraktSync Tray Experimental"
 BASE_DIR = Path(__file__).resolve().parent
-LOCAL_APPDATA = Path(os.environ["LOCALAPPDATA"]) / "PlexTraktSync" / "PlexTraktSync"
+PLEXTRAKTSYNC_APPDATA = Path(os.environ["LOCALAPPDATA"]) / "PlexTraktSync" / "PlexTraktSync"
+LOCAL_APPDATA = Path(os.environ["LOCALAPPDATA"]) / "PlexTraktSyncTrayExperimental"
 PLEXTRAKTSYNC_PYTHON = Path.home() / "pipx" / "venvs" / "plextraktsync" / "Scripts" / "python.exe"
-LOG_FILE = LOCAL_APPDATA / "Logs" / "plextraktsync.log"
+LOG_FILE = PLEXTRAKTSYNC_APPDATA / "Logs" / "plextraktsync.log"
 TRAY_LOG_FILE = LOCAL_APPDATA / "Logs" / "plextraktsync-tray.log"
-PYTRAKT_CONFIG_FILE = LOCAL_APPDATA / ".pytrakt.json"
-SERVERS_CONFIG_FILE = LOCAL_APPDATA / "servers.yml"
+PYTRAKT_CONFIG_FILE = PLEXTRAKTSYNC_APPDATA / ".pytrakt.json"
+SERVERS_CONFIG_FILE = PLEXTRAKTSYNC_APPDATA / "servers.yml"
 LEGACY_COMPLETED_MOVIE_STATE_FILE = LOCAL_APPDATA / "completed_movie_sync_state.json"
 TARGET_SYNC_LEDGER_FILE = LOCAL_APPDATA / "target_sync.sqlite"
 CHECK_INTERVAL_SECONDS = 10
@@ -42,7 +43,7 @@ RESTART_DELAY_SECONDS = 15
 LOG_TAIL_BYTES = 65536
 CREATE_NO_WINDOW = 0x08000000
 ERROR_ALREADY_EXISTS = 183
-MUTEX_NAME = "Local\\PlexTraktSyncTrayApp"
+MUTEX_NAME = "Local\\PlexTraktSyncTrayExperimentalApp"
 PLEX_BASE_URL = "http://127.0.0.1:32400"
 PLEX_WEB_URL = f"{PLEX_BASE_URL}/web"
 TRAKT_WEB_URL = "https://trakt.tv/"
@@ -55,7 +56,7 @@ SIMKL_API_BASE_URL = "https://api.simkl.com"
 SIMKL_WEB_URL = "https://simkl.com/"
 SIMKL_PIN_URL = "https://simkl.com/pin"
 SIMKL_CONFIG_FILE = LOCAL_APPDATA / "simkl_target.json"
-SIMKL_KEYRING_SERVICE = "PlexTraktSyncTray.Simkl"
+SIMKL_KEYRING_SERVICE = "PlexTraktSyncTrayExperimental.Simkl"
 SIMKL_KEYRING_TOKEN_USERNAME = "oauth"
 SIMKL_DEFAULT_CLIENT_ID = ""
 SIMKL_APP_VERSION = "0.1.0-experimental"
@@ -1209,7 +1210,7 @@ def get_latest_plextraktsync_version() -> str:
 
 
 def plextraktsync_server_name() -> str:
-    env_path = LOCAL_APPDATA / ".env"
+    env_path = PLEXTRAKTSYNC_APPDATA / ".env"
     try:
         for line in env_path.read_text(encoding="utf-8").splitlines():
             if line.startswith("PLEX_SERVER="):

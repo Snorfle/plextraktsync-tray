@@ -4,6 +4,14 @@ Status: first implementation draft
 Reviewed: 2026-06-24  
 Proposed branch: `experimental/simkl-target`
 
+Update, 2026-06-28: the experimental branch now uses a separate Windows app
+identity from the normal tray release: `PlexTraktSync Tray Experimental`,
+`PlexTraktSyncTrayExperimental.exe`, a separate scheduled task, a separate
+Start menu shortcut, a separate mutex, a separate Simkl Credential Manager
+service, and a separate local runtime folder at
+`%LOCALAPPDATA%\PlexTraktSyncTrayExperimental`. It still reads the underlying
+PlexTraktSync config and watch log from `%LOCALAPPDATA%\PlexTraktSync\PlexTraktSync`.
+
 ## Decision
 
 Simkl is a good candidate for an experimental target. It has an official,
@@ -101,7 +109,7 @@ Suggested flow:
 4. Poll in one background thread at the server-provided interval.
 5. Stop on success, expiry, shutdown, or an unexpected replacement-code
    response.
-6. Store the token under service `PlexTraktSyncTray.Simkl`, username `oauth`.
+6. Store the token under service `PlexTraktSyncTrayExperimental.Simkl`, username `oauth`.
 7. Call `/users/settings` once to validate the token and cache the account ID,
    username, and plan type without logging the token.
 8. Offer `Disconnect Simkl`, which removes only the stored Simkl credential and

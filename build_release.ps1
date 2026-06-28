@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.3.0"
+    [string]$Version = "simkl-0.1.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,12 +10,13 @@ $pythonExe = Join-Path $venvDir "Scripts\python.exe"
 $requirements = Join-Path $baseDir "requirements.txt"
 $appScript = Join-Path $baseDir "plextraktsync_tray.py"
 $appIcon = Join-Path $baseDir "assets\PlexTraktSyncTray.ico"
+$appPackageName = "PlexTraktSyncTrayExperimental"
 $releaseDir = Join-Path $baseDir "release"
 $pyinstallerWorkDir = Join-Path $releaseDir "pyinstaller-build"
 $pyinstallerDistDir = Join-Path $releaseDir "pyinstaller-dist"
-$distAppDir = Join-Path $pyinstallerDistDir "PlexTraktSyncTray"
-$stagingDir = Join-Path $releaseDir "PlexTraktSyncTray-$Version"
-$zipPath = Join-Path $releaseDir "PlexTraktSyncTray-$Version.zip"
+$distAppDir = Join-Path $pyinstallerDistDir $appPackageName
+$stagingDir = Join-Path $releaseDir "$appPackageName-$Version"
+$zipPath = Join-Path $releaseDir "$appPackageName-$Version.zip"
 
 if (-not (Test-Path $venvDir)) {
     py -3 -m venv $venvDir
@@ -26,7 +27,7 @@ if (-not (Test-Path $venvDir)) {
 & $pythonExe -m pip install pyinstaller
 
 New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
-& $pythonExe -m PyInstaller --noconfirm --windowed --name PlexTraktSyncTray --icon $appIcon --distpath $pyinstallerDistDir --workpath $pyinstallerWorkDir --specpath $releaseDir $appScript
+& $pythonExe -m PyInstaller --noconfirm --windowed --name $appPackageName --icon $appIcon --distpath $pyinstallerDistDir --workpath $pyinstallerWorkDir --specpath $releaseDir $appScript
 
 if (Test-Path $stagingDir) {
     Remove-Item -LiteralPath $stagingDir -Recurse -Force
@@ -36,7 +37,7 @@ if (Test-Path $zipPath) {
 }
 
 New-Item -ItemType Directory -Path $stagingDir | Out-Null
-Copy-Item -LiteralPath $distAppDir -Destination (Join-Path $stagingDir "PlexTraktSyncTray") -Recurse
+Copy-Item -LiteralPath $distAppDir -Destination (Join-Path $stagingDir $appPackageName) -Recurse
 Copy-Item -LiteralPath (Join-Path $baseDir "assets") -Destination (Join-Path $stagingDir "assets") -Recurse
 Copy-Item -LiteralPath (Join-Path $baseDir "install_release.ps1") -Destination $stagingDir
 Copy-Item -LiteralPath (Join-Path $baseDir "README.md") -Destination $stagingDir

@@ -6,9 +6,11 @@ $pythonExe = Join-Path $venvDir "Scripts\python.exe"
 $requirements = Join-Path $baseDir "requirements.txt"
 $appScript = Join-Path $baseDir "plextraktsync_tray.py"
 $appIcon = Join-Path $baseDir "assets\PlexTraktSyncTray.ico"
-$appExe = Join-Path $baseDir "dist\PlexTraktSyncTray\PlexTraktSyncTray.exe"
-$taskName = "PlexTraktSync Tray"
-$shortcutName = "PlexTraktSync Tray.lnk"
+$appDisplayName = "PlexTraktSync Tray Experimental"
+$appPackageName = "PlexTraktSyncTrayExperimental"
+$appExe = Join-Path $baseDir "dist\$appPackageName\$appPackageName.exe"
+$taskName = "PlexTraktSync Tray Experimental"
+$shortcutName = "PlexTraktSync Tray Experimental.lnk"
 $programsDir = [Environment]::GetFolderPath("Programs")
 $shortcutPath = Join-Path $programsDir $shortcutName
 $user = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { "$env:COMPUTERNAME\$env:USERNAME" }
@@ -28,7 +30,7 @@ function Install-StartMenuShortcut {
     $shortcut.TargetPath = $TargetPath
     $shortcut.WorkingDirectory = Split-Path -Parent $TargetPath
     $shortcut.IconLocation = "$appIcon,0"
-    $shortcut.Description = "Launch PlexTraktSync Tray"
+    $shortcut.Description = "Launch PlexTraktSync Tray Experimental"
     $shortcut.Save()
 }
 
@@ -39,7 +41,7 @@ if (-not (Test-Path $venvDir)) {
 & $pythonExe -m pip install --upgrade pip
 & $pythonExe -m pip install -r $requirements
 & $pythonExe -m pip install pyinstaller
-& $pythonExe -m PyInstaller --noconfirm --windowed --name PlexTraktSyncTray --icon $appIcon $appScript
+& $pythonExe -m PyInstaller --noconfirm --windowed --name $appPackageName --icon $appIcon $appScript
 
 # Clean up the old pre-tray task name if it exists.
 try {
@@ -52,8 +54,8 @@ $watchdogTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -Repetitio
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Days 0) -MultipleInstances IgnoreNew
 
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logonTrigger, $watchdogTrigger) -Principal $principal -Settings $settings -Description "Starts the PlexTraktSync tray app at logon and checks every minute that it is still running." -Force | Out-Null
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logonTrigger, $watchdogTrigger) -Principal $principal -Settings $settings -Description "Starts the experimental PlexTraktSync tray app at logon and checks every minute that it is still running." -Force | Out-Null
 Install-StartMenuShortcut -TargetPath $appExe
 Start-ScheduledTask -TaskName $taskName
 
-Write-Host "Tray app installed, added to the Start menu, and started."
+Write-Host "$appDisplayName installed, added to the Start menu, and started."
