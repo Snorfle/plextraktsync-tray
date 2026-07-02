@@ -104,20 +104,56 @@ This branch includes experimental target dispatchers:
 
 Simkl support is opt-in on this experimental branch. It is not part of the normal `main` release line.
 
-To try it as a developer:
+This target is meant for people who want PlexTraktSync Tray to send completed
+Plex watches to Simkl. If Simkl is already connected directly to the same Plex
+server through Simkl's own Plex integration, do not enable this target for the
+same account unless you are intentionally testing duplicate handling.
+
+What it syncs:
+
+- completed Plex movies
+- completed Plex TV episodes
+- the original Plex completion timestamp
+
+What it does not sync:
+
+- ratings
+- live scrobble/progress state
+- rewatches as separate Simkl rewatch sessions
+- deletes or reconciliation of old Simkl history
+
+#### Simkl Setup
 
 1. Register a Simkl application and set its client ID:
 
+   - Open [Simkl Developer Settings](https://simkl.com/settings/developer/).
+   - Create an app for this experimental tray build.
+   - Use the experimental branch URL as the project or redirect URL if Simkl requires one:
+     `https://github.com/Snorfle/plextraktsync-tray/tree/experimental/simkl-target`
+   - Copy the app's client ID. A client secret is not needed for this PIN flow.
+
+2. Create or edit `%LOCALAPPDATA%\PlexTraktSyncTrayExperimental\simkl_target.json`:
+
 ```powershell
-$env:SIMKL_CLIENT_ID = "your-client-id"
+New-Item -ItemType Directory -Path "$env:LOCALAPPDATA\PlexTraktSyncTrayExperimental" -Force
+@{
+  enabled = $false
+  client_id = "your-simkl-client-id"
+  account_id = $null
+  username = $null
+  account_type = $null
+} | ConvertTo-Json | Set-Content "$env:LOCALAPPDATA\PlexTraktSyncTrayExperimental\simkl_target.json"
 ```
 
-2. Start the tray and choose `Connect Simkl`.
-3. Approve the PIN in the browser window that opens.
+3. Start `PlexTraktSync Tray Experimental`.
+4. Right-click the tray icon and choose `Connect Simkl`.
+5. Approve the PIN in the browser window that opens.
 
 The tray stores the Simkl access token in Windows Credential Manager under `PlexTraktSyncTrayExperimental.Simkl`. Non-secret Simkl settings live in `%LOCALAPPDATA%\PlexTraktSyncTrayExperimental\simkl_target.json`.
 
 The Simkl target checks whether the exact movie or episode is already watched before writing history. It preserves the Plex completion timestamp and records the result in the local target ledger under `simkl`.
+
+To disconnect later, use `Disconnect Simkl` from the experimental tray menu. That removes the stored Simkl token and disables the Simkl target without touching PlexTraktSync's Trakt login.
 
 ### Experimental Build Identity
 
