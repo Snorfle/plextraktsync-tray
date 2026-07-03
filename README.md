@@ -88,9 +88,17 @@ PlexTraktSync normally handles Trakt scrobbling directly. The tray also watches 
 
 A movie counts as completed when PlexTraktSync reports `Played: True` or when playback stops at 90% or later. That second rule matches Plex's default watched threshold and covers cases where Plex has marked the movie watched but PlexTraktSync's event still says `Played: False`.
 
-## Experimental Target Ledger
+## Experimental Targets
 
-The experimental multi-target branch stores completed Plex movie and episode events in a local SQLite ledger at `%LOCALAPPDATA%\PlexTraktSync\PlexTraktSync\target_sync.sqlite`.
+This branch includes two opt-in experimental targets in addition to the normal
+PlexTraktSync/Trakt watcher:
+
+- Serializd episode logging
+- Simkl movie and episode history sync
+
+The normal `main` release does not include these targets.
+
+The experimental multi-target branch stores completed Plex movie and episode events in a local SQLite ledger at `%LOCALAPPDATA%\PlexTraktSyncTrayExperimental\target_sync.sqlite`.
 
 The ledger separates media events from target attempts so targets can be handled independently. For example, a movie can be `synced` on Trakt while an episode is synced to Serializd.
 
@@ -99,6 +107,46 @@ This branch includes experimental target dispatchers:
 - Trakt writes the existing missed-movie fallback only.
 - Serializd writes completed episodes when a bearer token is available from `SERIALIZD_TOKEN` or the existing Streaming History Sync Serializd token in Windows Credential Manager.
 - Simkl writes completed movies and episodes through Simkl's official API when a Simkl client ID and user token are configured.
+
+### Experimental Serializd Target
+
+Serializd support is opt-in and episode-only. It is based on Serializd's
+current private web API behavior, not a documented public API, so treat it as
+more fragile than the Simkl target.
+
+What it syncs:
+
+- completed Plex TV episodes
+- the original Plex completion date
+
+What it does not sync:
+
+- movies
+- ratings
+- live scrobble/progress state
+- deletes or reconciliation of old Serializd logs
+
+#### Serializd Setup
+
+The Serializd target does not include a login flow or `Connect Serializd`
+button. It needs a bearer token from your own Serializd account. The simplest
+setup for testers is a user environment variable:
+
+```powershell
+setx SERIALIZD_TOKEN "your-serializd-bearer-token"
+```
+
+After setting it, restart `PlexTraktSync Tray Experimental` so the scheduled
+task sees the new environment variable.
+
+If you already use Streaming History Sync on the same Windows account, this
+branch can also reuse the existing Windows Credential Manager entry:
+
+- service: `StreamingHistorySync.Serializd`
+- username: `oauth`
+
+Serializd stays inactive when no token is configured. The tray menu will show
+`Serializd: not configured (...)` in that state.
 
 ### Experimental Simkl Target
 
@@ -165,7 +213,7 @@ The Simkl branch intentionally uses separate Windows identity anchors:
 - packaged app folder/exe: `PlexTraktSyncTrayExperimental`
 - app mutex: `PlexTraktSyncTrayExperimentalApp`
 - Simkl Credential Manager service: `PlexTraktSyncTrayExperimental.Simkl`
-- tray diagnostics and target ledger: `%LOCALAPPDATA%\PlexTraktSyncTrayExperimental`
+- tray diagnostics, target ledger, and Simkl settings: `%LOCALAPPDATA%\PlexTraktSyncTrayExperimental`
 
 It still reads PlexTraktSync's existing watch log and config from `%LOCALAPPDATA%\PlexTraktSync\PlexTraktSync`, because those belong to the underlying PlexTraktSync install.
 
