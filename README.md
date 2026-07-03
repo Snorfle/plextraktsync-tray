@@ -17,6 +17,13 @@ This was vibe-coded with Codex during a real "please just make Plex and Trakt be
 - checks Trakt auth in the background and alerts if PlexTraktSync's saved token stops working
 - falls back to marking movies watched on Trakt when Plex reports a stopped movie at 90% or later
 
+## Experimental Branches
+
+Simkl support is being tested separately on the
+[`experimental/simkl-target`](https://github.com/Snorfle/plextraktsync-tray/tree/experimental/simkl-target)
+branch. It is intentionally separate from the normal tray release and should be
+treated as experimental.
+
 ## Install
 
 ### Windows Release Zip
