@@ -344,6 +344,11 @@ class TargetLedger:
                         """
                         select target, status, count(*) as count
                           from target_attempts
+                         where id in (
+                           select max(id)
+                             from target_attempts
+                            group by media_event_id, target
+                         )
                          group by target, status
                          order by target, status
                         """
@@ -1682,6 +1687,21 @@ def simkl_response_reports_item(response: dict[str, object], event: MediaEvent) 
     top_result = response.get("result")
     if event.content_type == "movie" and isinstance(top_result, bool):
         return top_result
+    added = response.get("added")
+    if isinstance(added, dict):
+        statuses = added.get("statuses")
+        if isinstance(statuses, list):
+            expected_type = "movie" if event.content_type == "movie" else None
+            for item in statuses:
+                if not isinstance(item, dict):
+                    continue
+                item_response = item.get("response")
+                if not isinstance(item_response, dict):
+                    continue
+                status = str(item_response.get("status", "")).lower()
+                simkl_type = str(item_response.get("simkl_type", "")).lower()
+                if status in {"completed", "watching"} and (expected_type is None or simkl_type == expected_type):
+                    return True
     for container_key in ("added", "result"):
         container = response.get(container_key)
         if isinstance(container, dict):
@@ -1928,6 +1948,8 @@ def friendly_error(exc: Exception) -> str:
         return f"HTTP {exc.code}"
     if isinstance(exc, FileNotFoundError):
         return "token file missing"
+    if isinstance(exc, RuntimeError) and str(exc):
+        return str(exc)
     return type(exc).__name__
 
 

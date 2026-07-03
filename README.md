@@ -189,6 +189,8 @@ Use `Check Auth Now` from the tray menu to force the check.
 - added Simkl PIN connection, Credential Manager token storage, and disconnect support
 - records Simkl target outcomes in the multi-target ledger
 - split the experimental Windows app identity from the normal tray release
+- accepts Simkl history responses that confirm completion in `added.statuses`
+- summarizes only the latest target result for each item
 
 ### v0.3.0
 
