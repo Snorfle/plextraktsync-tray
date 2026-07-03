@@ -1021,6 +1021,13 @@ class WatcherManager:
             return "Install PlexTraktSync Update"
         return "Check for PlexTraktSync Update"
 
+    def update_action_enabled(self) -> bool:
+        if self.updating or self.version_checking:
+            return False
+        if self.current_version and self.latest_version and self.current_version == self.latest_version:
+            return False
+        return True
+
     def check_versions(self, notify: bool = False, already_claimed: bool = False) -> None:
         with self.lock:
             if self.version_checking and not already_claimed:
@@ -1093,13 +1100,47 @@ class WatcherManager:
                     self.last_error = str(exc)
             refresh_icon()
 
+    def verify_and_upgrade_plextraktsync(self, already_claimed: bool = False) -> None:
+        with self.lock:
+            if self.version_checking and not already_claimed:
+                return
+            self.version_checking = True
+            self.version_check_error = None
+
+        try:
+            current_version = get_installed_plextraktsync_version()
+            latest_version = get_latest_plextraktsync_version()
+            with self.lock:
+                self.current_version = current_version
+                self.latest_version = latest_version
+            if current_version == latest_version:
+                notify_message(f"PlexTraktSync is current ({current_version}).")
+                return
+        except Exception as exc:
+            with self.lock:
+                self.version_check_error = str(exc)
+            notify_message(f"Version check failed: {exc}")
+            return
+        finally:
+            with self.lock:
+                self.version_checking = False
+            refresh_icon()
+
+        with self.lock:
+            if self.updating:
+                return
+            self.updating = True
+        self.upgrade_plextraktsync(already_claimed=True)
+
     def claim_update_action(self):
         with self.lock:
             if self.updating or self.version_checking:
                 return None, None
+            if self.current_version and self.latest_version and self.current_version == self.latest_version:
+                return None, None
             if self.current_version and self.latest_version and self.current_version != self.latest_version:
-                self.updating = True
-                return "Updating PlexTraktSync...", lambda: self.upgrade_plextraktsync(already_claimed=True)
+                self.version_checking = True
+                return "Verifying PlexTraktSync update...", lambda: self.verify_and_upgrade_plextraktsync(already_claimed=True)
             self.version_checking = True
             return "Checking PlexTraktSync version...", lambda: self.check_versions(notify=True, already_claimed=True)
 
@@ -2220,7 +2261,7 @@ def build_menu() -> pystray.Menu:
         Item("Stop Watcher", on_stop, enabled=lambda _: manager.is_running()),
         Item(lambda _: "Resume Watcher" if manager.paused else "Pause Watcher", on_pause_resume),
         Item("Restart Watcher", on_restart),
-        Item(lambda _: manager.update_action_text(), on_update_plextraktsync, enabled=lambda _: not manager.updating and not manager.version_checking),
+        Item(lambda _: manager.update_action_text(), on_update_plextraktsync, enabled=lambda _: manager.update_action_enabled()),
         Item("Check Auth Now", on_check_auth, enabled=lambda _: not auth_health.running),
         Item("Connect Simkl", on_connect_simkl, enabled=lambda _: not simkl_integration.is_configured()),
         Item("Disconnect Simkl", on_disconnect_simkl, enabled=lambda _: simkl_integration.is_configured()),
