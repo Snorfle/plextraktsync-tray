@@ -397,6 +397,13 @@ class WatcherManager:
             return "Install PlexTraktSync Update"
         return "Check for PlexTraktSync Update"
 
+    def update_action_enabled(self) -> bool:
+        if self.updating or self.version_checking:
+            return False
+        if self.current_version and self.latest_version and self.current_version == self.latest_version:
+            return False
+        return True
+
     def check_versions(self, notify: bool = False, already_claimed: bool = False) -> None:
         with self.lock:
             if self.version_checking and not already_claimed:
@@ -421,6 +428,40 @@ class WatcherManager:
         finally:
             with self.lock:
                 self.version_checking = False
+            refresh_icon()
+
+    def verify_and_upgrade_plextraktsync(self, already_claimed: bool = False) -> None:
+        with self.lock:
+            if (self.updating or self.version_checking) and not already_claimed:
+                return
+            self.version_checking = True
+            self.updating = False
+            self.version_check_error = None
+
+        try:
+            current_version = get_installed_plextraktsync_version()
+            latest_version = get_latest_plextraktsync_version()
+            with self.lock:
+                self.current_version = current_version
+                self.latest_version = latest_version
+
+            if current_version and latest_version and current_version == latest_version:
+                notify_message(f"PlexTraktSync is current ({current_version}).")
+                return
+
+            with self.lock:
+                self.version_checking = False
+                self.updating = True
+            refresh_icon()
+            self.upgrade_plextraktsync(already_claimed=True)
+        except Exception as exc:
+            with self.lock:
+                self.version_check_error = str(exc)
+            notify_message(f"Version check failed: {exc}")
+        finally:
+            with self.lock:
+                if self.version_checking:
+                    self.version_checking = False
             refresh_icon()
 
     def upgrade_plextraktsync(self, already_claimed: bool = False) -> None:
@@ -473,9 +514,11 @@ class WatcherManager:
         with self.lock:
             if self.updating or self.version_checking:
                 return None, None
+            if self.current_version and self.latest_version and self.current_version == self.latest_version:
+                return None, None
             if self.current_version and self.latest_version and self.current_version != self.latest_version:
-                self.updating = True
-                return "Updating PlexTraktSync...", lambda: self.upgrade_plextraktsync(already_claimed=True)
+                self.version_checking = True
+                return "Verifying PlexTraktSync update...", lambda: self.verify_and_upgrade_plextraktsync(already_claimed=True)
             self.version_checking = True
             return "Checking PlexTraktSync version...", lambda: self.check_versions(notify=True, already_claimed=True)
 
@@ -1219,7 +1262,7 @@ def build_menu() -> pystray.Menu:
         Item("Stop Watcher", on_stop, enabled=lambda _: manager.is_running()),
         Item(lambda _: "Resume Watcher" if manager.paused else "Pause Watcher", on_pause_resume),
         Item("Restart Watcher", on_restart),
-        Item(lambda _: manager.update_action_text(), on_update_plextraktsync, enabled=lambda _: not manager.updating and not manager.version_checking),
+        Item(lambda _: manager.update_action_text(), on_update_plextraktsync, enabled=lambda _: manager.update_action_enabled()),
         Item("Check Auth Now", on_check_auth, enabled=lambda _: not auth_health.running),
         Item(lambda _: "Disable Start With Windows" if startup_cache.get() else "Enable Start With Windows", on_toggle_startup),
         Item("Open Plex Web", on_open_plex),
