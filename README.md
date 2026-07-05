@@ -107,6 +107,12 @@ Use `Check Auth Now` from the tray menu to force the check.
 
 ## Changelog
 
+### v0.3.2
+
+- resolve the tray's current playback status through Plex metadata so it shows clean titles instead of compact PlexTraktSync log labels
+- disable the PlexTraktSync update action when the installed version is already current
+- re-check installed and latest PlexTraktSync versions before running an update from a cached update-available state
+
 ### v0.3.1
 
 - refresh Trakt OAuth credentials one day before expiry instead of waiting for PlexTraktSync's final ten-minute window
