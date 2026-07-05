@@ -62,6 +62,8 @@ SIMKL_DEFAULT_CLIENT_ID = ""
 SIMKL_APP_VERSION = "0.1.0-experimental"
 PYPI_JSON_URL = "https://pypi.org/pypi/plextraktsync/json"
 PLAYBACK_STALE_MINUTES = 30
+PLAYBACK_TITLE_CACHE_SECONDS = 6 * 60 * 60
+PLAYBACK_TITLE_FAILURE_CACHE_SECONDS = 60
 WATCHED_PROGRESS_THRESHOLD = 90.0
 TRAKT_AUTH_CHECK_SECONDS = 15 * 60
 TRAKT_AUTH_RETRY_SECONDS = 60
@@ -69,7 +71,8 @@ TRAKT_REFRESH_MARGIN_SECONDS = 24 * 60 * 60
 SIMKL_POST_INTERVAL_SECONDS = 1.05
 SIMKL_RETRYABLE_HTTP_CODES = {429, 500, 502, 503}
 ON_PLAY_PATTERN = re.compile(
-    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\[.*?\]:on_play: <[^>]+:(?P<title>.+)>: (?P<progress>\d+(?:\.\d+)?)%, State: (?P<state>\w+)",
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\[.*?\]:on_play: "
+    r"<(?P<kind>[^:>]+):(?P<rating_key>\d+):(?P<title>.+)>: (?P<progress>\d+(?:\.\d+)?)%, State: (?P<state>\w+)",
 )
 WATCHED_MEDIA_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\[.*?\]:on_play: "
@@ -1157,6 +1160,8 @@ tray_icon: pystray.Icon | None = None
 shutdown_event = threading.Event()
 instance_mutex = None
 _last_icon_state: tuple[bool, bool, str | None, bool | None] | None = None
+playback_title_cache: dict[str, tuple[str, float]] = {}
+playback_title_cache_lock = threading.Lock()
 
 
 class StartupCache:
@@ -1997,6 +2002,40 @@ def friendly_error(exc: Exception) -> str:
 auth_health = AuthHealth()
 
 
+def playback_display_title(rating_key: str, fallback_title: str) -> str:
+    now = time.time()
+    with playback_title_cache_lock:
+        cached = playback_title_cache.get(rating_key)
+        if cached and cached[1] > now:
+            return cached[0]
+
+    try:
+        root = plex_metadata_root(rating_key)
+        item = root.find(".//Video")
+        if item is None:
+            item = root.find(".//Directory")
+        if item is None:
+            raise RuntimeError("Plex metadata item missing")
+
+        item_type = item.attrib.get("type", "")
+        title = item.attrib.get("title", "").strip()
+        grandparent_title = item.attrib.get("grandparentTitle", "").strip()
+        if item_type == "episode" and grandparent_title and title:
+            display_title = f"{grandparent_title} - {title}"
+        else:
+            display_title = title or fallback_title
+
+        expires_at = now + PLAYBACK_TITLE_CACHE_SECONDS
+    except Exception as exc:
+        logging.debug("Unable to resolve Plex playback title for %s: %s", rating_key, exc)
+        display_title = fallback_title
+        expires_at = now + PLAYBACK_TITLE_FAILURE_CACHE_SECONDS
+
+    with playback_title_cache_lock:
+        playback_title_cache[rating_key] = (display_title, expires_at)
+    return display_title
+
+
 def current_playback_text() -> str:
     """Return a short human status by reading recent PlexTraktSync watch logs."""
 
@@ -2031,7 +2070,10 @@ def current_playback_text() -> str:
         if state == "stopped":
             return "Running: idle"
 
-        title = match.group("title").strip()
+        title = playback_display_title(
+            match.group("rating_key"),
+            match.group("title").strip(),
+        )
         try:
             progress = float(match.group("progress"))
         except ValueError:
