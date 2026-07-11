@@ -794,6 +794,7 @@ class CompletedMediaSync:
             media_event_id = self.ledger.media_event_id(source_event_key)
             if event.kind.lower() == "movie":
                 if self._legacy_sync_key(event) in self.legacy_synced_keys:
+                    self._record_legacy_handled_movie(event, media_event_id)
                     continue
                 if self.dispatcher.may_have_pending_work(event, media_event_id, self.ledger):
                     return event
@@ -850,6 +851,28 @@ class CompletedMediaSync:
             with self.lock:
                 self.running = False
             refresh_icon()
+
+    def _record_legacy_handled_movie(self, event: PlexPlaybackEvent, media_event_id: int | None) -> None:
+        if media_event_id is not None and self.ledger.target_confirmed(media_event_id, "trakt"):
+            return
+
+        try:
+            media_event = media_event_from_plex_event(event)
+            media_event_id = self.ledger.upsert_media_event(media_event)
+            if self.ledger.target_confirmed(media_event_id, "trakt"):
+                return
+            self.ledger.record_target_attempt(
+                media_event_id,
+                "trakt",
+                "synced",
+                request_summary=f"{media_event.content_type} {media_event.title}",
+                response_summary="recorded from legacy completed movie fallback state",
+            )
+            self.last_status = f"Target sync: backfilled legacy movie {media_event.title}"
+            logging.info("Backfilled legacy completed movie into target ledger: %s", media_event.title)
+        except Exception as exc:
+            self.last_status = f"Target sync legacy backfill failed: {friendly_error(exc)}"
+            logging.warning("Unable to backfill legacy completed movie %s: %s", event.title, exc)
 
     def _load_legacy_synced_keys(self) -> set[str]:
         if not self.legacy_state_path.exists():
