@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -175,7 +176,7 @@ class TargetLedger:
 
     def init(self) -> None:
         with self.lock:
-            with self.connect() as conn:
+            with self.connection() as conn:
                 conn.executescript(TARGET_LEDGER_SCHEMA)
 
     def connect(self) -> sqlite3.Connection:
@@ -184,6 +185,15 @@ class TargetLedger:
         conn.row_factory = sqlite3.Row
         conn.execute("pragma foreign_keys = on")
         return conn
+
+    @contextmanager
+    def connection(self):
+        conn = self.connect()
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
     def source_event_key(self, event: WatchedMovieEvent) -> str:
         return f"plex:movie:{event.rating_key}:{event.timestamp.isoformat(timespec='minutes')}"
@@ -203,7 +213,7 @@ class TargetLedger:
             logging.warning("Unable to enrich target ledger movie %s: %s", event.title, exc)
 
         with self.lock:
-            with self.connect() as conn:
+            with self.connection() as conn:
                 existing = conn.execute(
                     "select id from media_events where source_event_key = ?",
                     (source_event_key,),
@@ -236,13 +246,12 @@ class TargetLedger:
                         datetime.now().isoformat(timespec="seconds"),
                     ),
                 )
-                conn.commit()
                 return int(cursor.lastrowid)
 
     def target_confirmed(self, event: WatchedMovieEvent, target: str) -> bool:
         source_event_key = self.source_event_key(event)
         with self.lock:
-            with self.connect() as conn:
+            with self.connection() as conn:
                 row = conn.execute(
                     """
                     select 1
@@ -266,7 +275,7 @@ class TargetLedger:
         response_summary: str | None = None,
     ) -> None:
         with self.lock:
-            with self.connect() as conn:
+            with self.connection() as conn:
                 conn.execute(
                     """
                     insert into target_attempts(
@@ -283,7 +292,6 @@ class TargetLedger:
                         datetime.now().isoformat(timespec="seconds"),
                     ),
                 )
-                conn.commit()
 
 
 class CompletedMovieSync:
