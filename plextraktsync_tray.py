@@ -934,7 +934,8 @@ def completed_movie_event_from_log_line(line: str) -> WatchedMovieEvent | None:
         return None
     played = match.group("played") == "True"
     stopped_at_threshold = match.group("state").lower() == "stopped" and progress >= WATCHED_PROGRESS_THRESHOLD
-    if not played and not stopped_at_threshold:
+    played_at_threshold = played and progress >= WATCHED_PROGRESS_THRESHOLD
+    if not played_at_threshold and not stopped_at_threshold:
         return None
 
     try:
