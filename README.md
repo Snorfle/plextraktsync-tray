@@ -107,6 +107,11 @@ Use `Check Auth Now` from the tray menu to force the check.
 
 ## Changelog
 
+### v0.3.3
+
+- dedupe legacy movie fallback ledger rows by Plex movie and watch date instead of writing one row per watched log minute
+- update an existing fallback ledger row to the latest timestamp and progress so downstream importers see one canonical completion
+
 ### v0.3.2
 
 - resolve the tray's current playback status through Plex metadata so it shows clean titles instead of compact PlexTraktSync log labels

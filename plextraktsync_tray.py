@@ -196,7 +196,7 @@ class TargetLedger:
             conn.close()
 
     def source_event_key(self, event: WatchedMovieEvent) -> str:
-        return f"plex:movie:{event.rating_key}:{event.timestamp.isoformat(timespec='minutes')}"
+        return f"plex:movie:{event.rating_key}:{event.timestamp.date().isoformat()}"
 
     def upsert_movie_event(self, event: WatchedMovieEvent) -> int:
         source_event_key = self.source_event_key(event)
@@ -215,10 +215,33 @@ class TargetLedger:
         with self.lock:
             with self.connection() as conn:
                 existing = conn.execute(
-                    "select id from media_events where source_event_key = ?",
+                    "select id, watched_at from media_events where source_event_key = ?",
                     (source_event_key,),
                 ).fetchone()
                 if existing:
+                    existing_watched_at = datetime.fromisoformat(str(existing["watched_at"]))
+                    if event.timestamp >= existing_watched_at:
+                        conn.execute(
+                            """
+                            update media_events
+                               set title = ?,
+                                   watched_at = ?,
+                                   tmdb_id = ?,
+                                   imdb_id = ?,
+                                   tvdb_id = ?,
+                                   progress = ?
+                             where id = ?
+                            """,
+                            (
+                                title,
+                                event.timestamp.isoformat(timespec="seconds"),
+                                int_or_none(ids.get("tmdb")),
+                                str(ids["imdb"]) if ids.get("imdb") else None,
+                                int_or_none(ids.get("tvdb")),
+                                event.progress,
+                                int(existing["id"]),
+                            ),
+                        )
                     return int(existing["id"])
 
                 cursor = conn.execute(
@@ -382,9 +405,6 @@ class CompletedMovieSync:
             refresh_icon()
 
     def _record_legacy_handled_movie(self, event: WatchedMovieEvent) -> None:
-        if self.target_ledger.target_confirmed(event, "trakt"):
-            return
-
         try:
             media_event_id = self.target_ledger.upsert_movie_event(event)
             if self.target_ledger.target_confirmed(event, "trakt"):
